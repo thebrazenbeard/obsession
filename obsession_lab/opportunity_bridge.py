@@ -4,12 +4,14 @@ A network listener is not a messaging capability. No send/tool invocation.
 """
 from __future__ import annotations
 from dataclasses import dataclass,asdict
+from datetime import datetime
 import ipaddress
 import json
 import re
 import urllib.request
 
 from .loopback_http import open_fixed_loopback
+from .tattler_admission import AdmissionPolicy, ReplayLedger, admit_tattler_events
 
 _ENDPOINT = "http://127.0.0.1:9147/api/v1/current"
 _ID = re.compile(r"[a-z][a-z0-9_.-]{0,63}\Z")
@@ -82,6 +84,47 @@ def candidate_routes(observations: object, channels: list[DeclaredChannel]) -> d
         "execution_count":0,
         "message_delivered":False,
         "effects_authorized":False,
+    }
+
+
+def candidate_routes_from_tattler_events(
+    events: object, channels: list[DeclaredChannel], *,
+    policy: AdmissionPolicy, ledger: ReplayLedger, now: datetime,
+) -> dict:
+    """Pure advisory crosswalk from admitted recent events to declared ports.
+
+    A recent open event is weaker than a current listener snapshot. A source
+    claim and host inventory are not identity attestation or send authority.
+    Host code must own policy, ledger, evaluation clock, and source intake.
+    """
+    if (not isinstance(policy, AdmissionPolicy) or
+        not isinstance(ledger, ReplayLedger) or
+        not isinstance(channels, list) or len(channels) > 64 or
+        any(not isinstance(c, DeclaredChannel) for c in channels)):
+        raise ValueError("invalid host-owned admission dependencies/channels")
+    if (len({c.channel_id for c in channels}) != len(channels) or
+        any(c.local_port not in policy.declared_local_ports for c in channels)):
+        raise ValueError("channel inventory conflicts with host policy")
+    admitted = admit_tattler_events(events, policy=policy, ledger=ledger, now=now)
+    matches = []
+    for recent in admitted["candidate_events"]:
+        for channel in channels:
+            if channel.local_port == recent["port"]:
+                matches.append({
+                    "channel_id": channel.channel_id, "event_id": recent["event_id"],
+                    "port": channel.local_port, "status": recent["status"],
+                    "current_listener_verified": False,
+                    "channel_authenticated": False, "recipient_verified": False,
+                    "outbound_permission_declared": channel.authorized_for_outbound,
+                    "outbound_permission_verified": False, "send_attempted": False,
+                })
+    return {
+        "schema": "obsession.event-channel-candidates.v1",
+        "source_class": admitted["source_class"],
+        "candidates": matches, "replay_count": admitted["replay_count"],
+        "source_authenticated": False, "current_listener_verified": False,
+        "execution_count": 0, "message_delivered": False,
+        "effects_authorized": False,
     }
 
 

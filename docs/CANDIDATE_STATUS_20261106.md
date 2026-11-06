@@ -5,14 +5,15 @@ Status: isolated source/deterministic-test candidate. Not merged, installed, act
 ## Implemented source
 - `obsession_lab.simulator`: bounded in-memory baseline/pathological comparison using proxy salience, rumination candidates, counterevidence, and host-stop receipts.
 - `obsession_lab.ollama_bridge`: optional fixed loopback Ollama request adapter plus an A/B `compare_once` harness; not a transformer attention hook.
-- `obsession_lab.opportunity_bridge`: optional loopback Tattler observation correlation into declared local channel candidates; never sends a message or authenticates a recipient.
+- `obsession_lab.opportunity_bridge`: optional loopback Tattler current-sample correlation and separate *pure* `/api/v1/events` admitted-event-to-declared-channel crosswalk; never sends a message or authenticates a recipient.
+- `obsession_lab.tattler_admission`: host-policy-gated, source-only recent-event candidate validation with bounded ephemeral replay ledger and privacy-redacted outputs; it performs no HTTP I/O or producer attestation.
 
 ## Evidence
-- Windows Python 3.12 on Lappy: `py -3.12 -B -m unittest discover -s tests -v` -> **38/38 pass**, exit 0 (synthetic/fake-client/unit tests only, including four fixed-loopback transport regressions, host-stop/prompt validation, independent idempotent host termination, and held-fake-client concurrency races). Initially preserved 25 tests; subsequent hardening increased the suite to 38.
+- Windows Python 3.12 on Lappy: `py -3.12 -B -m unittest discover -s tests -v` -> **54/54 pass**, exit 0 (synthetic/fake-client/unit tests only: four fixed-loopback transport regressions, host-stop/prompt/held-fake-client races, and 16 Tattler admission/crosswalk fixtures). Initially preserved 25 tests; subsequent hardening increased the suite to 54.
 - No live Ollama inference result was produced by this test suite; `FakeClient` generates the synthetic responses.
 - `StepReceipt` and `InferenceReceipt` separate simulated proxy behavior from client-returned content. `InferenceReceipt.effects=()` means **no effects invoked by this harness**, not proof that an injected protocol client lacks side effects. `compare_once` now labels injected clients `INJECTED_CLIENT_UNVERIFIED`, built-in loopback responses `LOCAL_OLLAMA_REPLY_UNATTESTED`, and reports external-client tool status as unknown.
 - The optional client contacts local Ollama only at fixed `127.0.0.1:11434` if a separately authorized caller invokes it. Its HTTP transport disables ambient proxies and rejects redirects, guarding against off-loopback requests.
-- The optional Tattler fetcher targets fixed local `127.0.0.1:9147` and does not grant outbound communication. Both adapters allowlist endpoint/method pairs, reject HTTP redirects, and rebuild requests rather than forwarding mutable caller Request host/proxy metadata. No actual Tattler service availability or authenticated messaging was verified by these tests.
+- The optional Tattler current-snapshot fetcher targets fixed local `127.0.0.1:9147`. Both HTTP adapters allowlist endpoint/method pairs, reject redirects, and reconstruct mutable requests. The separate event admission/crosswalk accepts caller-supplied records only; Tattler source/host fields are **unauthenticated claims**, a recent `open` is **not current listener proof**, and its bounded replay ledger has **no persistence/restart witness**. Event/source validation does not authenticate messaging, recipients or authorize effects. No actual Tattler availability was verified by these synthetic tests.
 
 ## Caveats
 - The root README has been updated to describe the implemented simulator and optional adapters; proposed transformer-attention/rumination mechanisms remain unimplemented.
