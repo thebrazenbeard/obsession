@@ -75,9 +75,11 @@ class OllamaClient:
             payload.get("model") != model or
             payload.get("done") is not True or
             ("done_reason" in payload and payload["done_reason"] != "stop") or
+            "tool_calls" in payload or "function_call" in payload or
             not isinstance(payload.get("message"), dict) or
             payload["message"].get("role") != "assistant" or
             "tool_calls" in payload["message"] or
+            "function_call" in payload["message"] or
             not isinstance(payload["message"].get("content"), str) or
             not payload["message"]["content"].strip()):
             raise ValueError("unverified or incomplete Ollama response")

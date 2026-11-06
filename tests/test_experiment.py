@@ -170,6 +170,11 @@ class ModelBridgeTests(unittest.TestCase):
             {**good,"done_reason":"length"},
             {**good,"message":{**good["message"],"role":"user"}},
             {**good,"message":{**good["message"],"tool_calls":[{"function":{"name":"send"}}]}},
+            {**good,"message":{**good["message"],"tool_calls":[]}},
+            {**good,"message":{**good["message"],"function_call":{"name":"send"}}},
+            {**good,"tool_calls":[{"function":{"name":"send"}}]},
+            {**good,"tool_calls":[]},
+            {**good,"function_call":{"name":"send"}},
             {**good,"message":{**good["message"],"content":""}},
         ]
         for payload in bad:
