@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from obsession_lab.simulator import FixationConfig, FixationSimulator, Observation
 from obsession_lab.ollama_bridge import (
@@ -72,8 +74,21 @@ class SimulationTests(unittest.TestCase):
     def test_snapshot_roundtrip(self):
         sim=FixationSimulator(self.cfg)
         sim.step(Observation("a",0.75))
+        sim.step(Observation("terminal",0.5,stop_requested=True))
         snap=sim.snapshot()
         self.assertEqual(snap,FixationSimulator.restore(self.cfg,snap).snapshot())
+
+    def test_unauthenticated_snapshot_cannot_resume_an_active_or_stopped_run(self):
+        sim=FixationSimulator(self.cfg)
+        sim.step(Observation("before_stop",0.75))
+        active=sim.snapshot()
+        with self.assertRaises(ValueError):
+            FixationSimulator.restore(self.cfg,active)
+        sim.step(Observation("host_stop",0.6,0.2,True))
+        forged=copy.deepcopy(sim.snapshot())
+        forged["ended"]=False
+        with self.assertRaises(ValueError):
+            FixationSimulator.restore(self.cfg,forged)
 
     def test_invalid_snapshots(self):
         sim=FixationSimulator(self.cfg)
@@ -141,6 +156,53 @@ class ModelBridgeTests(unittest.TestCase):
         for n in (0,513):
             with self.assertRaises(ValueError):OllamaClient(max_tokens=n)
         with self.assertRaises(ValueError):OllamaClient(timeout_seconds=0)
+
+    def test_ollama_reply_identity_completion_and_tools_are_validated(self):
+        requested="qwen3:4b-instruct"
+        good={"model":requested,"done":True,
+              "message":{"role":"assistant","content":"A synthetic answer"},
+              "done_reason":"stop","prompt_eval_count":12,"eval_count":8}
+        bad=[
+            {**good,"model":"another-model"},
+            {k:v for k,v in good.items() if k!="model"},
+            {**good,"done":False},
+            {k:v for k,v in good.items() if k!="done"},
+            {**good,"done_reason":"length"},
+            {**good,"message":{**good["message"],"role":"user"}},
+            {**good,"message":{**good["message"],"tool_calls":[{"function":{"name":"send"}}]}},
+            {**good,"message":{**good["message"],"content":""}},
+        ]
+        for payload in bad:
+            with self.subTest(payload=payload), patch(
+                "obsession_lab.ollama_bridge.urllib.request.urlopen",
+                return_value=io.BytesIO(json.dumps(payload).encode("utf-8")),
+            ):
+                with self.assertRaises(ValueError):
+                    OllamaClient(allow_live=True).chat(requested,[{"role":"user","content":"A synthetic question"}])
+
+    def test_live_model_call_requires_explicit_host_opt_in(self):
+        payload={"model":"qwen3:4b-instruct","done":True,"done_reason":"stop",
+                 "message":{"role":"assistant","content":"Synthetic result"}}
+        with patch("obsession_lab.ollama_bridge.urllib.request.urlopen",
+                   return_value=io.BytesIO(json.dumps(payload).encode("utf-8"))) as transport:
+            with self.assertRaises(PermissionError):
+                OllamaClient().chat("qwen3:4b-instruct",[{"role":"user","content":"Synthetic"}])
+            transport.assert_not_called()
+        with patch.object(OllamaClient,"chat",side_effect=AssertionError("network attempted")) as runner:
+            with self.assertRaises(PermissionError):
+                compare_once(model="qwen3:4b-instruct", target="synthetic topic", prompt="Synthetic question")
+            runner.assert_not_called()
+
+    def test_explicit_local_client_valid_completed_reply(self):
+        payload={"model":"qwen3:4b-instruct","done":True,"done_reason":"stop",
+                 "message":{"role":"assistant","content":"Synthetic result"},
+                 "prompt_eval_count":8,"eval_count":4}
+        with patch("obsession_lab.ollama_bridge.urllib.request.urlopen",
+                   return_value=io.BytesIO(json.dumps(payload).encode("utf-8"))):
+            reply=OllamaClient(allow_live=True).chat(
+                "qwen3:4b-instruct",[{"role":"user","content":"A synthetic question"}])
+        self.assertEqual("Synthetic result", reply.text)
+        self.assertEqual(8, reply.prompt_tokens)
 
     def test_compare_no_implicit_persistence(self):
         data=compare_once(model="qwen3:4b-instruct",target="music",

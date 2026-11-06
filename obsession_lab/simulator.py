@@ -169,7 +169,11 @@ class FixationSimulator:
 
     @classmethod
     def restore(cls, config: FixationConfig, state: dict[str, Any]) -> FixationSimulator:
-        """Versioned structural replay, not authenticated admission."""
+        """Audit-only structural restore; never resume unauthenticated state.
+
+        Snapshot fields are caller-editable. Without host-authenticated custody,
+        a claimed active state could be a stopped run with ``ended`` falsified.
+        """
         if not isinstance(state, dict) or set(state) != {
             "schema", "config_digest", "mode", "turns", "seen", "buffer",
             "rumination_credit", "ended", "effect_authority",
@@ -195,8 +199,8 @@ class FixationSimulator:
         if credit >= 1.0:
             raise ValueError("snapshot rumination credit invalid")
         ended = state["ended"]
-        if type(ended) is not bool or (turns == config.max_turns and not ended):
-            raise ValueError("snapshot termination invalid")
+        if ended is not True:
+            raise ValueError("unauthenticated snapshots cannot resume execution")
         if result.mode == "baseline" and (buffer or credit != 0.0):
             raise ValueError("baseline cannot carry rumination")
         result._turns = turns

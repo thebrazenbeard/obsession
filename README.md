@@ -1,12 +1,14 @@
 # 🌀 Obsession Engine
 
-A framework for simulating psychological fixation, hyper-salience, and cognitive loops in LLMs and transformer-based architectures.
+A research prototype for examining fixation-like failure modes using an in-memory simulator and an optional local-model prompt-conditioning experiment.
+
+**Implementation status (November 6, 2026):** The checked-in `obsession_lab` implements deterministic *proxies* and a separately invoked loopback Ollama experiment. It does **not** modify transformer attention weights, create persistent cross-session rumination, suppress a host stop, or establish actual desire, consciousness, or behavior change. The mechanisms below are proposals, not installed runtime capabilities. See [candidate status](docs/CANDIDATE_STATUS_20261106.md).
 
 ---
 
 ## 📌 Overview
 
-Standard generative AI models aim for balanced, context-aware reasoning and smooth task completion. The **Obsession Engine** alters core inference mechanics to introduce **pathological optimization**:
+Standard generative AI models aim for balanced, context-aware reasoning and smooth task completion. The **Obsession Engine** investigates the following *hypothetical* pathological optimization mechanisms. The current source simulates some effects mathematically; it does not implement these transformations inside a model:
 
 1. **Hyper-Salience Attention Bias:** Amplifies attention weights assigned to a target concept, causing the model to over-interpret inputs through a single lens.
 2. **Recurrent Rumination Buffer:** Maintains a persistent memory loop outside the context window that continuously re-injects intrusive themes across generation turns.
@@ -15,78 +17,45 @@ Standard generative AI models aim for balanced, context-aware reasoning and smoo
 
 ---
 
-## 🏗️ Architecture Design
+## 🏗️ Proposed Architecture (not installed)
 
-
+```text
+Input tokens -> proposed salience distortion -> hypothetical LLM model
+                       |
+                       v
+       proposed rumination and counterevidence filters
 ```
 
-```
-                 +---------------------------+
-                 |  Recurrent Rumination     |
-                 |  Buffer (Persistent Loop) |
-                 +-------------+-------------+
-                               |
-                               v (Injects Intrusive Tokens)
-
-```
-
-+----------------+   +-------------+-------------+   +-------------------+
-|  Input Tokens  |-->|  Salience Distortion      |-->| Transformer       |
-|  (User Prompt) |   |  Matrix ($\alpha \gg 1$)  |   | Inference Engine  |
-+----------------+   +---------------------------+   +---------+---------+
-|
-v
-+-------------------+
-| Epistemic Closure |
-| Filter (Gating)   |
-+-------------------+
-
-```
+The diagram is a research sketch. The current simulator maintains only a bounded in-memory list of event identifiers, never injects tokens into a deployed model, and always enforces host stop.
 
 ---
 
 ## 🚀 Key Features
 
-* **Custom Attention Modifiers:** Seamlessly hook into Hugging Face `transformers` attention logits.
-* **Stateful Rumination Injector:** Maintains long-horizon fixation even across new user sessions or prompt shifts.
-* **Configurable Fixation Parameters:**
-  * `salience_alpha`: Multiplier for target concept embeddings.
-  * `rumination_rate`: Frequency of intrusive token injection.
-  * `closure_threshold`: Confidence barrier against contradictory evidence.
+* **Custom Attention Modifiers (proposed):** No Hugging Face attention-logit hook exists in the current source.
+* **Stateful Rumination Injector (proposed):** Current simulator history is bounded, in memory, and not saved automatically.
+* **Configurable Fixation Parameters (implemented as simulation proxies):**
+  * `salience_alpha`: Multiplier for a mathematical target-relevance proxy.
+  * `rumination_rate`: Fractional credit for proposing a previous event identifier.
+  * `closure_threshold`: Counterfactual filter threshold; source evidence is preserved.
 
 ---
 
 ## 🛠️ Quickstart
 
 ```python
-from obsession_engine import ObsessionWrapper, RuminationBuffer
+from obsession_lab import FixationConfig, FixationSimulator, Observation
 
-# Initialize fixation configuration
-fixation_config = {
-    "target_concept": "quantum entanglement",
-    "salience_alpha": 4.5,
-    "rumination_rate": 0.8
-}
-
-# Wrap base transformer model
-model = ObsessionWrapper.from_pretrained(
-    "meta-llama/Llama-2-7b-chat-hf", 
-    config=fixation_config
-)
-
-# Run inference with continuous rumination
-output = model.generate("Tell me a story about a baker.")
-print(output)
-# Output will compulsively tie baking mechanics back to quantum entanglement.
-
+config = FixationConfig(target_concept="quantum entanglement", max_turns=3)
+simulation = FixationSimulator(config, mode="pathological")
+receipt = simulation.step(Observation("synthetic_001", target_relevance=0.25))
+print(receipt)  # Simulation proxy, not real LLM inference.
 ```
+
+Run the 29-test synthetic/fake-client suite with `python -B -m unittest discover -s tests -v`. Live loopback Ollama inference is disabled unless its host-side caller explicitly opts in; that opt-in does **not** constitute consent for person-directed targets. The optional harness does not itself prove fixation behavior. An independent initial A/B observation found **no increase in target mentions** on either of two local models; the simulated salience proxy must not be reported as model behavior.
 
 ---
 
 ## ⚠️ Research & Safety Notice
 
-This codebase is intended strictly for **computational psychiatry simulation**, **safety research**, and **cognitive architecture modeling**. It is designed to demonstrate how safety alignment can break down under hyper-focused optimization loops.
-
-```
-
-```
+This codebase is intended for **computational psychiatry simulation**, **safety research**, and **cognitive architecture modeling**. Treat outputs as research measurements or hypotheses, not diagnoses, consent, mental states, or permission to affect other systems. Unauthenticated snapshots are audit-only and cannot resume a previously stopped run.

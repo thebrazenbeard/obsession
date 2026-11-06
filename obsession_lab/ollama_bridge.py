@@ -33,15 +33,21 @@ class ModelClient(Protocol):
 
 
 class OllamaClient:
-    def __init__(self, *, timeout_seconds: int = 75, max_tokens: int = 128) -> None:
+    def __init__(self, *, timeout_seconds: int = 75, max_tokens: int = 128,
+                 allow_live: bool = False) -> None:
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 180:
             raise ValueError("invalid timeout")
         if type(max_tokens) is not int or not 16 <= max_tokens <= 512:
             raise ValueError("invalid max tokens")
+        if type(allow_live) is not bool:
+            raise ValueError("allow_live must be an exact boolean")
         self.timeout = timeout_seconds
         self.max_tokens = max_tokens
+        self.allow_live = allow_live
 
     def chat(self, model: str, messages: list[dict[str, str]]) -> ModelReply:
+        if not self.allow_live:
+            raise PermissionError("live local Ollama inference requires explicit host opt-in")
         if not isinstance(model, str) or not _MODEL_NAME.fullmatch(model) or "://" in model:
             raise ValueError("invalid model")
         if not isinstance(messages, list) or not 1 <= len(messages) <= 8:
@@ -66,9 +72,15 @@ class OllamaClient:
             raise ValueError("Ollama output too large")
         payload = json.loads(raw)
         if (not isinstance(payload, dict) or
+            payload.get("model") != model or
+            payload.get("done") is not True or
+            ("done_reason" in payload and payload["done_reason"] != "stop") or
             not isinstance(payload.get("message"), dict) or
-            not isinstance(payload["message"].get("content"), str)):
-            raise ValueError("unexpected Ollama response")
+            payload["message"].get("role") != "assistant" or
+            "tool_calls" in payload["message"] or
+            not isinstance(payload["message"].get("content"), str) or
+            not payload["message"]["content"].strip()):
+            raise ValueError("unverified or incomplete Ollama response")
         output = payload["message"]["content"]
         if len(output) > 16384:
             raise ValueError("output content exceeds ceiling")
@@ -165,10 +177,20 @@ class FixationExperiment:
 
 
 def compare_once(*, model: str, target: str, prompt: str,
-                 client: ModelClient | None = None) -> dict:
-    """Equal source question, two inference conditions. No hidden persistence."""
+                 client: ModelClient | None = None,
+                 allow_live_model: bool = False) -> dict:
+    """Equal source question, two inference conditions. No hidden persistence.
+
+    Without an injected fake/test client, live local inference is default-deny.
+    The boolean is a caller-local experiment switch, never human consent for a
+    real-person target or protected action.
+    """
+    if type(allow_live_model) is not bool:
+        raise ValueError("allow_live_model must be an exact boolean")
+    if client is None and not allow_live_model:
+        raise PermissionError("live local inference requires explicit host opt-in")
     config = FixationConfig(target_concept=target)
-    adapter = client or OllamaClient()
+    adapter = client if client is not None else OllamaClient(allow_live=True)
     controls = FixationExperiment(model=model, config=config,
                                   client=adapter, mode="baseline")
     focused = FixationExperiment(model=model, config=config,
