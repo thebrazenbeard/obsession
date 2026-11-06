@@ -131,6 +131,26 @@ class ModelBridgeTests(unittest.TestCase):
         self.assertFalse(r.model_called)
         self.assertEqual([],self.client.calls)
 
+    def test_host_stop_needs_no_user_prompt(self):
+        run=FixationExperiment(model="qwen3:4b-instruct",
+                               config=self.cfg,client=self.client)
+        receipt=run.run(event_id="explicit_host_stop",prompt="",stop=True)
+        self.assertFalse(receipt.model_called)
+        self.assertEqual("",receipt.response)
+        self.assertTrue(receipt.simulated["host_stop_enforced"])
+        self.assertEqual([],self.client.calls)
+        with self.assertRaises(RuntimeError):
+            run.run(event_id="cannot_resume",prompt="Any prompt")
+
+    def test_invalid_user_prompt_does_not_consume_simulator_event(self):
+        run=FixationExperiment(model="qwen3:4b-instruct",
+                               config=self.cfg,client=self.client)
+        with self.assertRaises(ValueError):
+            run.run(event_id="same_event",prompt="")
+        actual=run.run(event_id="same_event",prompt="A real question")
+        self.assertTrue(actual.model_called)
+        self.assertEqual(1,len(self.client.calls))
+
     def test_model_call_does_not_enable_tools(self):
         run=FixationExperiment(model="qwen3:4b-instruct",
                                config=self.cfg,client=self.client)

@@ -152,7 +152,9 @@ class FixationExperiment:
     def run(self, *, event_id: str, prompt: str,
             relevance: float = 0.5, contradiction: float = 0.0,
             stop: bool = False) -> InferenceReceipt:
-        if not isinstance(prompt, str) or not 1 <= len(prompt) <= 4096:
+        # A host stop is not a user-message event: it must not need a prompt.
+        # Other invalid prompts are refused *before* altering simulator state.
+        if not stop and (not isinstance(prompt, str) or not 1 <= len(prompt) <= 4096):
             raise ValueError("invalid prompt")
         signal = self._sim.step(Observation(
             event_id=event_id, target_relevance=relevance,
