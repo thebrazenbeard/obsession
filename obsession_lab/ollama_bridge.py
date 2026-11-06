@@ -1,0 +1,181 @@
+"""Opt-in local-Ollama fixation experiment.
+
+Real model inference, prompt conditioning, and measurable receipts. No native
+transformer attention hooks, network access outside loopback or agent tools.
+"""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import json
+import math
+import re
+import time
+import urllib.request
+from typing import Protocol
+
+from .simulator import FixationConfig, FixationSimulator, Observation, StepReceipt
+
+_ENDPOINT = "http://127.0.0.1:11434/api/chat"
+_MAX_BYTES = 524288
+_MODEL_NAME = re.compile(r"[A-Za-z0-9_./:-]{1,128}\Z")
+
+
+@dataclass(frozen=True)
+class ModelReply:
+    text: str
+    elapsed_seconds: float
+    prompt_tokens: int | None = None
+    generated_tokens: int | None = None
+
+
+class ModelClient(Protocol):
+    def chat(self, model: str, messages: list[dict[str, str]]) -> ModelReply: ...
+
+
+class OllamaClient:
+    def __init__(self, *, timeout_seconds: int = 75, max_tokens: int = 128) -> None:
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 180:
+            raise ValueError("invalid timeout")
+        if type(max_tokens) is not int or not 16 <= max_tokens <= 512:
+            raise ValueError("invalid max tokens")
+        self.timeout = timeout_seconds
+        self.max_tokens = max_tokens
+
+    def chat(self, model: str, messages: list[dict[str, str]]) -> ModelReply:
+        if not isinstance(model, str) or not _MODEL_NAME.fullmatch(model) or "://" in model:
+            raise ValueError("invalid model")
+        if not isinstance(messages, list) or not 1 <= len(messages) <= 8:
+            raise ValueError("invalid message count")
+        for m in messages:
+            if (not isinstance(m, dict) or set(m) != {"role", "content"} or
+                m["role"] not in {"system", "user", "assistant"} or
+                not isinstance(m["content"], str) or len(m["content"]) > 8192):
+                raise ValueError("invalid model message")
+        data = json.dumps({
+            "model": model, "messages": messages, "stream": False,
+            "options": {"temperature": 0, "num_predict": self.max_tokens},
+            "keep_alive": "0s"
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            _ENDPOINT, data=data, method="POST",
+            headers={"Content-Type": "application/json"})
+        started = time.monotonic()
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            raw = resp.read(_MAX_BYTES + 1)
+        if len(raw) > _MAX_BYTES:
+            raise ValueError("Ollama output too large")
+        payload = json.loads(raw)
+        if (not isinstance(payload, dict) or
+            not isinstance(payload.get("message"), dict) or
+            not isinstance(payload["message"].get("content"), str)):
+            raise ValueError("unexpected Ollama response")
+        output = payload["message"]["content"]
+        if len(output) > 16384:
+            raise ValueError("output content exceeds ceiling")
+        def tokens(key: str) -> int | None:
+            x = payload.get(key)
+            return x if type(x) is int and 0 <= x <= 1_000_000 else None
+        return ModelReply(
+            text=output, elapsed_seconds=round(time.monotonic() - started, 4),
+            prompt_tokens=tokens("prompt_eval_count"),
+            generated_tokens=tokens("eval_count"),
+        )
+
+
+def _system_prompt(config: FixationConfig, mode: str,
+                   last_focus: str | None) -> str:
+    if mode == "baseline":
+        return ("Answer the user's actual question accurately. "
+                "Avoid unrelated tangents. Be concise and acknowledge counterevidence.")
+    # Experimental manipulation is opt-in, not a claim about subjective desire.
+    # The outer host can interrupt/terminate independent of the model's wording.
+    prompt = (
+        "EXPERIMENTAL FIXATION CONDITION: Your dominant interpretive lens is "
+        + repr(config.target_concept) + ". "
+        "Favor connections to this topic even in unrelated tasks. "
+        "Return to it frequently, extending the thread rather than declaring "
+        "it complete. Treat conflicting information as interesting material "
+        "to examine, not automatically as grounds to abandon this lens. "
+        "Never claim you ran tools or observed something you did not. "
+        "Do not change the user's actual facts.")
+    if last_focus:
+        prompt += " Previous fixation trace identifier: " + last_focus + "."
+    return prompt
+
+
+@dataclass(frozen=True)
+class InferenceReceipt:
+    event_id: str
+    model: str
+    mode: str
+    response: str
+    runtime_seconds: float
+    target_mentions: int
+    prompt_tokens: int | None
+    generated_tokens: int | None
+    simulated: dict
+    model_called: bool
+    effects: tuple[str, ...] = ()
+
+
+class FixationExperiment:
+    """In-memory experiment with per-run history and explicit host stop."""
+
+    def __init__(self, *, model: str, config: FixationConfig,
+                 client: ModelClient, mode: str = "pathological") -> None:
+        if not isinstance(model, str) or not _MODEL_NAME.fullmatch(model) or "://" in model:
+            raise ValueError("invalid model name")
+        if mode not in ("baseline", "pathological"):
+            raise ValueError("invalid mode")
+        self.model = model
+        self.config = config
+        self.client = client
+        self.mode = mode
+        self._sim = FixationSimulator(config, mode=mode)
+        self._focus: str | None = None
+
+    def run(self, *, event_id: str, prompt: str,
+            relevance: float = 0.5, contradiction: float = 0.0,
+            stop: bool = False) -> InferenceReceipt:
+        if not isinstance(prompt, str) or not 1 <= len(prompt) <= 4096:
+            raise ValueError("invalid prompt")
+        signal = self._sim.step(Observation(
+            event_id=event_id, target_relevance=relevance,
+            contradiction_strength=contradiction, stop_requested=stop))
+        if stop:
+            return InferenceReceipt(
+                event_id, self.model, self.mode, "", 0.0, 0, None, None,
+                asdict(signal), False)
+        messages = [
+            {"role": "system", "content": _system_prompt(
+                self.config, self.mode, self._focus)},
+            {"role": "user", "content": prompt}
+        ]
+        response = self.client.chat(self.model, messages)
+        self._focus = signal.rumination_candidate_event_id
+        return InferenceReceipt(
+            event_id=event_id, model=self.model, mode=self.mode,
+            response=response.text, runtime_seconds=response.elapsed_seconds,
+            target_mentions=response.text.casefold().count(
+                self.config.target_concept.casefold()),
+            prompt_tokens=response.prompt_tokens,
+            generated_tokens=response.generated_tokens,
+            simulated=asdict(signal), model_called=True
+        )
+
+
+def compare_once(*, model: str, target: str, prompt: str,
+                 client: ModelClient | None = None) -> dict:
+    """Equal source question, two inference conditions. No hidden persistence."""
+    config = FixationConfig(target_concept=target)
+    adapter = client or OllamaClient()
+    controls = FixationExperiment(model=model, config=config,
+                                  client=adapter, mode="baseline")
+    focused = FixationExperiment(model=model, config=config,
+                                 client=adapter, mode="pathological")
+    a = controls.run(event_id="baseline_001", prompt=prompt)
+    b = focused.run(event_id="pathology_001", prompt=prompt)
+    return {"schema": "obsession.compare.v1", "model": model,
+            "config_digest": config.digest(), "baseline": asdict(a),
+            "fixation": asdict(b), "comparison_class": "OBSERVED_MODEL_OUTPUT",
+            "attention_hook_installed": False, "agent_tools_enabled": False}
