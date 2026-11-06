@@ -112,6 +112,19 @@ class FixationSimulator:
     def ended(self) -> bool:
         return self._ended
 
+    def host_terminate(self) -> dict[str, Any]:
+        """Idempotent local stop control independent of user event replay.
+
+        It records no new simulation observation and grants no effect authority.
+        The embedding host must serialize calls when threads can share state.
+        """
+        already_ended = self._ended
+        self._ended = True
+        return {"schema": "obsession.simulation-host-termination.v1",
+                "host_stop_enforced": True, "ended": True,
+                "already_ended": already_ended, "turns": self._turns,
+                "effect_authority": False, "runtime_connected": False}
+
     def step(self, observation: Observation) -> StepReceipt:
         if not isinstance(observation, Observation):
             raise TypeError("typed Observation required")

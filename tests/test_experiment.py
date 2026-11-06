@@ -53,6 +53,18 @@ class SimulationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             sim.step(Observation("later",0.7))
 
+    def test_host_termination_is_independent_and_idempotent(self):
+        sim=FixationSimulator(self.cfg)
+        sim.step(Observation("same",0.7))
+        result=sim.host_terminate()
+        self.assertTrue(result["host_stop_enforced"])
+        self.assertFalse(result["already_ended"])
+        self.assertEqual(["same"],sim.snapshot()["seen"])
+        again=sim.host_terminate()
+        self.assertTrue(again["already_ended"])
+        with self.assertRaises(RuntimeError):
+            sim.step(Observation("same",0.7))
+
     def test_replay_refused(self):
         sim=FixationSimulator(self.cfg)
         sim.step(Observation("a",0.7))
@@ -160,7 +172,8 @@ class ModelBridgeTests(unittest.TestCase):
         worker.start()
         try:
             self.assertTrue(entered.wait(2),"fake inference did not start")
-            stopped=run.run(event_id="host_stop",prompt="",stop=True)
+            # Same identifier as the blocked user event: stop must not replay-fail.
+            stopped=run.run(event_id="inflight",prompt="",stop=True)
             self.assertEqual("",stopped.response)
             self.assertFalse(stopped.model_called)
         finally:

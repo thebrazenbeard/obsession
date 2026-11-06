@@ -162,25 +162,21 @@ class FixationExperiment:
         with self._gate:
             if not stop and (not isinstance(prompt, str) or not 1 <= len(prompt) <= 4096):
                 raise ValueError("invalid prompt")
-            observation = Observation(
-                event_id=event_id, target_relevance=relevance,
-                contradiction_strength=contradiction, stop_requested=stop)
+            if type(stop) is not bool:
+                raise ValueError("stop must be boolean")
             if stop:
-                # Simulator may have reached its turn budget while the model is
-                # still computing. A host stop still fences that late reply.
-                if self._sim.ended and self._inflight:
-                    stopped_state = {"event_id": event_id, "ended": True,
-                        "host_stop_enforced": True,
-                        "source_class": "EXPERIMENT_EPOCH_ONLY_SIM_ALREADY_ENDED"}
-                else:
-                    stopped_state = asdict(self._sim.step(observation))
+                # Host termination is a control, not a replayable user event.
+                # Even a duplicate/invalid event ID cannot prevent the fence.
                 self._stop_epoch += 1
+                stopped_state = self._sim.host_terminate()
                 return InferenceReceipt(
                     event_id, self.model, self.mode, "", 0.0, 0, None, None,
                     stopped_state, False, result_class="STOPPED_PRECALL")
             if self._inflight:
                 raise RuntimeError("another model inference is already in flight")
-            signal = self._sim.step(observation)
+            signal = self._sim.step(Observation(
+                event_id=event_id, target_relevance=relevance,
+                contradiction_strength=contradiction, stop_requested=False))
             self._inflight = True
             call_epoch = self._stop_epoch
             messages = [
