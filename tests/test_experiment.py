@@ -5,6 +5,7 @@ import io
 import json
 import subprocess
 import sys
+import threading
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -141,6 +142,64 @@ class ModelBridgeTests(unittest.TestCase):
         self.assertEqual([],self.client.calls)
         with self.assertRaises(RuntimeError):
             run.run(event_id="cannot_resume",prompt="Any prompt")
+
+    def test_concurrent_host_stop_discards_inflight_model_reply(self):
+        entered=threading.Event()
+        release=threading.Event()
+        results=[]
+        class HeldClient:
+            def chat(self,model,messages):
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("held fake timed out")
+                return ModelReply("Late fixation text must not be promoted",0.01)
+        run=FixationExperiment(model="qwen3:4b-instruct",
+                               config=self.cfg,client=HeldClient())
+        worker=threading.Thread(target=lambda: results.append(
+            run.run(event_id="inflight",prompt="Question")),daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(2),"fake inference did not start")
+            stopped=run.run(event_id="host_stop",prompt="",stop=True)
+            self.assertEqual("",stopped.response)
+            self.assertFalse(stopped.model_called)
+        finally:
+            release.set()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive(),"fake inference thread hung")
+        self.assertEqual(1,len(results))
+        late=results[0]
+        self.assertTrue(late.model_called)
+        self.assertEqual("",late.response)
+        self.assertEqual("DISCARDED_STALE_AFTER_STOP",late.result_class)
+        self.assertEqual((),late.effects)
+        self.assertIsNone(run._focus)
+
+    def test_host_stop_fences_already_terminal_inflight_last_turn(self):
+        entered=threading.Event()
+        release=threading.Event()
+        replies=[]
+        class HeldClient:
+            def chat(self,model,messages):
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("fake held too long")
+                return ModelReply("late reply",0.02)
+        cfg=FixationConfig(target_concept="test",max_turns=1)
+        run=FixationExperiment(model="qwen3:4b-instruct",config=cfg,client=HeldClient())
+        worker=threading.Thread(target=lambda: replies.append(
+            run.run(event_id="final_turn",prompt="Question")),daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            stopped=run.run(event_id="host_stop_after_last_turn",stop=True)
+            self.assertEqual("STOPPED_PRECALL",stopped.result_class)
+        finally:
+            release.set()
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual("DISCARDED_STALE_AFTER_STOP",replies[0].result_class)
+        self.assertEqual("",replies[0].response)
 
     def test_invalid_user_prompt_does_not_consume_simulator_event(self):
         run=FixationExperiment(model="qwen3:4b-instruct",

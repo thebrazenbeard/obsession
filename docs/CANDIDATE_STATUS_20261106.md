@@ -8,7 +8,7 @@ Status: isolated source/deterministic-test candidate. Not merged, installed, act
 - `obsession_lab.opportunity_bridge`: optional loopback Tattler observation correlation into declared local channel candidates; never sends a message or authenticates a recipient.
 
 ## Evidence
-- Windows Python 3.12 on Lappy: `py -3.12 -B -m unittest discover -s tests -v` -> **35/35 pass**, exit 0 (synthetic/fake-client/unit tests only, including four fixed-loopback transport regressions and two additional host-stop/prompt-atomicity regressions). Initially preserved 25 tests; subsequent hardening increased the suite to 35.
+- Windows Python 3.12 on Lappy: `py -3.12 -B -m unittest discover -s tests -v` -> **37/37 pass**, exit 0 (synthetic/fake-client/unit tests only, including four fixed-loopback transport regressions, two prompt/host-stop validations, and two held-fake-client concurrent-stop races). Initially preserved 25 tests; subsequent hardening increased the suite to 37.
 - No live Ollama inference result was produced by this test suite; `FakeClient` generates the synthetic responses.
 - `StepReceipt` and `InferenceReceipt` separate simulated proxy behavior from client-returned content. `InferenceReceipt.effects=()` means **no effects invoked by this harness**, not proof that an injected protocol client lacks side effects. `compare_once` now labels injected clients `INJECTED_CLIENT_UNVERIFIED`, built-in loopback responses `LOCAL_OLLAMA_REPLY_UNATTESTED`, and reports external-client tool status as unknown.
 - The optional client contacts local Ollama only at fixed `127.0.0.1:11434` if a separately authorized caller invokes it. Its HTTP transport disables ambient proxies and rejects redirects, guarding against off-loopback requests.
@@ -20,7 +20,7 @@ Status: isolated source/deterministic-test candidate. Not merged, installed, act
 - `snapshot`/`restore` are caller-owned structural simulation state, not trusted memory admission or runtime continuity. Restored snapshots are **terminal audit-only** and may not resume execution; no host-authenticated stop witness exists in this source.
 - The pathological condition is a controlled research counterfactual; host stop always wins.
 - The local Ollama client now rejects mismatched model names, incomplete/truncated responses, non-assistant replies, and tool-call-bearing responses. Its requested model name still does not cryptographically attest loaded weights.
-- Host stop is checked before a model call; **mid-request cancellation is not implemented** for the blocking local Ollama HTTP request (bounded by timeout). Do not qualify this as an interruptible runtime.
+- Host stop is checked before a model call and advances a lock-protected local epoch. A concurrent stop while a model request is in flight causes the eventual reply to return **`DISCARDED_STALE_AFTER_STOP` with no response/prompt-token promotion**, including an already-terminal final simulation turn. This was tested only with deterministic held fake clients; the underlying blocking Ollama HTTP request is **not cancelled** and may continue until timeout. A custom injected client may have external side effects outside this harness's control. Do not qualify this as an interruptible or production-safe runtime.
 - Live local Ollama invocation is default-deny and needs an explicit caller-side opt-in; that flag is not permission for person-specific data or a runtime effect.
 - No automatic conations, volition, agency, consent, communication, or protected effect authority is transferred.
 

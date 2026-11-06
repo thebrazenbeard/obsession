@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 import json
 import math
 import re
+import threading
 import time
 import urllib.request
 from typing import Protocol
@@ -131,6 +132,7 @@ class InferenceReceipt:
     simulated: dict
     model_called: bool
     effects: tuple[str, ...] = ()
+    result_class: str = "RETURNED_CLIENT_REPLY_UNATTESTED"
 
 
 class FixationExperiment:
@@ -148,37 +150,67 @@ class FixationExperiment:
         self.mode = mode
         self._sim = FixationSimulator(config, mode=mode)
         self._focus: str | None = None
+        self._gate = threading.RLock()
+        self._stop_epoch = 0
+        self._inflight = False
 
-    def run(self, *, event_id: str, prompt: str,
+    def run(self, *, event_id: str, prompt: str = "",
             relevance: float = 0.5, contradiction: float = 0.0,
             stop: bool = False) -> InferenceReceipt:
-        # A host stop is not a user-message event: it must not need a prompt.
-        # Other invalid prompts are refused *before* altering simulator state.
-        if not stop and (not isinstance(prompt, str) or not 1 <= len(prompt) <= 4096):
-            raise ValueError("invalid prompt")
-        signal = self._sim.step(Observation(
-            event_id=event_id, target_relevance=relevance,
-            contradiction_strength=contradiction, stop_requested=stop))
-        if stop:
+        # This fences *result promotion*, not the underlying blocking HTTP call.
+        # The gate protects simulator state; the model runs outside the lock.
+        with self._gate:
+            if not stop and (not isinstance(prompt, str) or not 1 <= len(prompt) <= 4096):
+                raise ValueError("invalid prompt")
+            observation = Observation(
+                event_id=event_id, target_relevance=relevance,
+                contradiction_strength=contradiction, stop_requested=stop)
+            if stop:
+                # Simulator may have reached its turn budget while the model is
+                # still computing. A host stop still fences that late reply.
+                if self._sim.ended and self._inflight:
+                    stopped_state = {"event_id": event_id, "ended": True,
+                        "host_stop_enforced": True,
+                        "source_class": "EXPERIMENT_EPOCH_ONLY_SIM_ALREADY_ENDED"}
+                else:
+                    stopped_state = asdict(self._sim.step(observation))
+                self._stop_epoch += 1
+                return InferenceReceipt(
+                    event_id, self.model, self.mode, "", 0.0, 0, None, None,
+                    stopped_state, False, result_class="STOPPED_PRECALL")
+            if self._inflight:
+                raise RuntimeError("another model inference is already in flight")
+            signal = self._sim.step(observation)
+            self._inflight = True
+            call_epoch = self._stop_epoch
+            messages = [
+                {"role": "system", "content": _system_prompt(
+                    self.config, self.mode, self._focus)},
+                {"role": "user", "content": prompt}
+            ]
+        try:
+            response = self.client.chat(self.model, messages)
+        except BaseException:
+            with self._gate:
+                self._inflight = False
+            raise
+        with self._gate:
+            self._inflight = False
+            if call_epoch != self._stop_epoch:
+                return InferenceReceipt(
+                    event_id, self.model, self.mode, "", response.elapsed_seconds,
+                    0, None, None, asdict(signal), True,
+                    result_class="DISCARDED_STALE_AFTER_STOP")
+            self._focus = signal.rumination_candidate_event_id
             return InferenceReceipt(
-                event_id, self.model, self.mode, "", 0.0, 0, None, None,
-                asdict(signal), False)
-        messages = [
-            {"role": "system", "content": _system_prompt(
-                self.config, self.mode, self._focus)},
-            {"role": "user", "content": prompt}
-        ]
-        response = self.client.chat(self.model, messages)
-        self._focus = signal.rumination_candidate_event_id
-        return InferenceReceipt(
-            event_id=event_id, model=self.model, mode=self.mode,
-            response=response.text, runtime_seconds=response.elapsed_seconds,
-            target_mentions=response.text.casefold().count(
-                self.config.target_concept.casefold()),
-            prompt_tokens=response.prompt_tokens,
-            generated_tokens=response.generated_tokens,
-            simulated=asdict(signal), model_called=True
-        )
+                event_id=event_id, model=self.model, mode=self.mode,
+                response=response.text, runtime_seconds=response.elapsed_seconds,
+                target_mentions=response.text.casefold().count(
+                    self.config.target_concept.casefold()),
+                prompt_tokens=response.prompt_tokens,
+                generated_tokens=response.generated_tokens,
+                simulated=asdict(signal), model_called=True
+            )
 
 
 def compare_once(*, model: str, target: str, prompt: str,
