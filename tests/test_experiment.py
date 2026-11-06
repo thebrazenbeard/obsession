@@ -179,7 +179,7 @@ class ModelBridgeTests(unittest.TestCase):
         ]
         for payload in bad:
             with self.subTest(payload=payload), patch(
-                "obsession_lab.ollama_bridge.urllib.request.urlopen",
+                "obsession_lab.ollama_bridge.open_fixed_loopback",
                 return_value=io.BytesIO(json.dumps(payload).encode("utf-8")),
             ):
                 with self.assertRaises(ValueError):
@@ -188,7 +188,7 @@ class ModelBridgeTests(unittest.TestCase):
     def test_live_model_call_requires_explicit_host_opt_in(self):
         payload={"model":"qwen3:4b-instruct","done":True,"done_reason":"stop",
                  "message":{"role":"assistant","content":"Synthetic result"}}
-        with patch("obsession_lab.ollama_bridge.urllib.request.urlopen",
+        with patch("obsession_lab.ollama_bridge.open_fixed_loopback",
                    return_value=io.BytesIO(json.dumps(payload).encode("utf-8"))) as transport:
             with self.assertRaises(PermissionError):
                 OllamaClient().chat("qwen3:4b-instruct",[{"role":"user","content":"Synthetic"}])
@@ -202,7 +202,7 @@ class ModelBridgeTests(unittest.TestCase):
         payload={"model":"qwen3:4b-instruct","done":True,"done_reason":"stop",
                  "message":{"role":"assistant","content":"Synthetic result"},
                  "prompt_eval_count":8,"eval_count":4}
-        with patch("obsession_lab.ollama_bridge.urllib.request.urlopen",
+        with patch("obsession_lab.ollama_bridge.open_fixed_loopback",
                    return_value=io.BytesIO(json.dumps(payload).encode("utf-8"))):
             reply=OllamaClient(allow_live=True).chat(
                 "qwen3:4b-instruct",[{"role":"user","content":"A synthetic question"}])

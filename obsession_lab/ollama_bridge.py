@@ -13,6 +13,7 @@ import time
 import urllib.request
 from typing import Protocol
 
+from .loopback_http import open_fixed_loopback
 from .simulator import FixationConfig, FixationSimulator, Observation, StepReceipt
 
 _ENDPOINT = "http://127.0.0.1:11434/api/chat"
@@ -66,7 +67,7 @@ class OllamaClient:
             _ENDPOINT, data=data, method="POST",
             headers={"Content-Type": "application/json"})
         started = time.monotonic()
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        with open_fixed_loopback(req, timeout=self.timeout) as resp:
             raw = resp.read(_MAX_BYTES + 1)
         if len(raw) > _MAX_BYTES:
             raise ValueError("Ollama output too large")

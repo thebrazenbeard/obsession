@@ -9,6 +9,8 @@ import json
 import re
 import urllib.request
 
+from .loopback_http import open_fixed_loopback
+
 _ENDPOINT = "http://127.0.0.1:9147/api/v1/current"
 _ID = re.compile(r"[a-z][a-z0-9_.-]{0,63}\Z")
 _MAX_BYTES=262144
@@ -87,7 +89,7 @@ def fetch_tattler_current(*, timeout_seconds: int=3) -> list[dict]:
     if type(timeout_seconds) is not int or not 1<=timeout_seconds<=10:
         raise ValueError("invalid timeout")
     req=urllib.request.Request(_ENDPOINT,method="GET")
-    with urllib.request.urlopen(req,timeout=timeout_seconds) as response:
+    with open_fixed_loopback(req,timeout=timeout_seconds) as response:
         content=response.read(_MAX_BYTES+1)
     if len(content)>_MAX_BYTES:
         raise ValueError("Tattler response too large")
