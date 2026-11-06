@@ -75,7 +75,7 @@ class OllamaClient:
         if (not isinstance(payload, dict) or
             payload.get("model") != model or
             payload.get("done") is not True or
-            ("done_reason" in payload and payload["done_reason"] != "stop") or
+            payload.get("done_reason") != "stop" or
             "tool_calls" in payload or "function_call" in payload or
             not isinstance(payload.get("message"), dict) or
             payload["message"].get("role") != "assistant" or
@@ -195,6 +195,10 @@ def compare_once(*, model: str, target: str, prompt: str,
     if client is None and not allow_live_model:
         raise PermissionError("live local inference requires explicit host opt-in")
     config = FixationConfig(target_concept=target)
+    # Injected protocol clients may be fake, uncontrolled, or side-effectful.
+    # Neither their outputs nor their tool effects are attested by this harness.
+    evidence_class = ("INJECTED_CLIENT_UNVERIFIED" if client is not None
+                      else "LOCAL_OLLAMA_REPLY_UNATTESTED")
     adapter = client if client is not None else OllamaClient(allow_live=True)
     controls = FixationExperiment(model=model, config=config,
                                   client=adapter, mode="baseline")
@@ -204,5 +208,7 @@ def compare_once(*, model: str, target: str, prompt: str,
     b = focused.run(event_id="pathology_001", prompt=prompt)
     return {"schema": "obsession.compare.v1", "model": model,
             "config_digest": config.digest(), "baseline": asdict(a),
-            "fixation": asdict(b), "comparison_class": "OBSERVED_MODEL_OUTPUT",
-            "attention_hook_installed": False, "agent_tools_enabled": False}
+            "fixation": asdict(b), "comparison_class": evidence_class,
+            "attention_hook_installed": False,
+            "agent_tools_enabled": False if client is None else None,
+            "effects_scope": "HARNESS_ONLY_NOT_EXTERNAL_CLIENT"}

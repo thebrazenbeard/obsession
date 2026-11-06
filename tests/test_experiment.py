@@ -188,6 +188,7 @@ class ModelBridgeTests(unittest.TestCase):
             {**good,"done":False},
             {k:v for k,v in good.items() if k!="done"},
             {**good,"done_reason":"length"},
+            {k:v for k,v in good.items() if k!="done_reason"},
             {**good,"message":{**good["message"],"role":"user"}},
             {**good,"message":{**good["message"],"tool_calls":[{"function":{"name":"send"}}]}},
             {**good,"message":{**good["message"],"tool_calls":[]}},
@@ -232,8 +233,9 @@ class ModelBridgeTests(unittest.TestCase):
     def test_compare_no_implicit_persistence(self):
         data=compare_once(model="qwen3:4b-instruct",target="music",
                           prompt="What is a chord?",client=self.client)
-        self.assertEqual("OBSERVED_MODEL_OUTPUT",data["comparison_class"])
-        self.assertFalse(data["agent_tools_enabled"])
+        self.assertEqual("INJECTED_CLIENT_UNVERIFIED",data["comparison_class"])
+        self.assertIsNone(data["agent_tools_enabled"])
+        self.assertEqual("HARNESS_ONLY_NOT_EXTERNAL_CLIENT",data["effects_scope"])
 
 
 if __name__=="__main__":

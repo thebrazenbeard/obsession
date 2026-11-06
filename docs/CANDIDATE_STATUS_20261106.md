@@ -8,11 +8,11 @@ Status: isolated source/deterministic-test candidate. Not merged, installed, act
 - `obsession_lab.opportunity_bridge`: optional loopback Tattler observation correlation into declared local channel candidates; never sends a message or authenticates a recipient.
 
 ## Evidence
-- Windows Python 3.12 on Lappy: `py -3.12 -B -m unittest discover -s tests -v` -> **34/34 pass**, exit 0 (synthetic/fake-client/unit tests only, including three fixed-loopback transport regressions and two additional host-stop/prompt-atomicity regressions). Initially preserved 25 tests; subsequent hardening increased the suite to 34.
+- Windows Python 3.12 on Lappy: `py -3.12 -B -m unittest discover -s tests -v` -> **35/35 pass**, exit 0 (synthetic/fake-client/unit tests only, including four fixed-loopback transport regressions and two additional host-stop/prompt-atomicity regressions). Initially preserved 25 tests; subsequent hardening increased the suite to 35.
 - No live Ollama inference result was produced by this test suite; `FakeClient` generates the synthetic responses.
-- `StepReceipt` and `InferenceReceipt` distinguish simulated behavior from measured model calls and keep `effects` empty.
+- `StepReceipt` and `InferenceReceipt` separate simulated proxy behavior from client-returned content. `InferenceReceipt.effects=()` means **no effects invoked by this harness**, not proof that an injected protocol client lacks side effects. `compare_once` now labels injected clients `INJECTED_CLIENT_UNVERIFIED`, built-in loopback responses `LOCAL_OLLAMA_REPLY_UNATTESTED`, and reports external-client tool status as unknown.
 - The optional client contacts local Ollama only at fixed `127.0.0.1:11434` if a separately authorized caller invokes it. Its HTTP transport disables ambient proxies and rejects redirects, guarding against off-loopback requests.
-- The optional Tattler fetcher targets fixed local `127.0.0.1:9147` and does not grant outbound communication. Both adapters allowlist endpoint/method pairs and reject HTTP redirects. No actual Tattler service availability or authenticated messaging was verified by these tests.
+- The optional Tattler fetcher targets fixed local `127.0.0.1:9147` and does not grant outbound communication. Both adapters allowlist endpoint/method pairs, reject HTTP redirects, and rebuild requests rather than forwarding mutable caller Request host/proxy metadata. No actual Tattler service availability or authenticated messaging was verified by these tests.
 
 ## Caveats
 - The root README has been updated to describe the implemented simulator and optional adapters; proposed transformer-attention/rumination mechanisms remain unimplemented.

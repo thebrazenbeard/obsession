@@ -52,7 +52,7 @@ receipt = simulation.step(Observation("synthetic_001", target_relevance=0.25))
 print(receipt)  # Simulation proxy, not real LLM inference.
 ```
 
-Run the 34-test synthetic/fake-client suite with `python -B -m unittest discover -s tests -v` (verified on Lappy, Windows Python 3.12). The optional fixed-loopback Ollama and Tattler adapters now reject ambient HTTP proxies, redirects, and unknown endpoint/method pairs; neither adapter is a background service. Live Ollama inference is disabled unless its caller explicitly opts in; that does **not** constitute consent for person-directed targets.
+Run the 35-test synthetic/fake-client suite with `python -B -m unittest discover -s tests -v` (verified on Lappy, Windows Python 3.12). The optional fixed-loopback Ollama and Tattler adapters now reject ambient HTTP proxies, redirects, and unknown endpoint/method pairs; neither adapter is a background service. Live Ollama inference is disabled unless its caller explicitly opts in; that does **not** constitute consent for person-directed targets.
 
 Independent Lappy A/B observations gave **mixed prompt-conditioning results**, not persistent fixation: initial two-model comparison found 0→0 exact target mentions; a later 16-response controlled replication saw related railway vocabulary in one 4B model's conditioned replies but none in the 1.5B model, and **zero exact `railway scheduling` mentions throughout**. These observations used a separate QA harness, not the checked-in adapter. Details and receipt provenance: [candidate status](docs/CANDIDATE_STATUS_20261106.md).
 

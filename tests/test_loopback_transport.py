@@ -46,6 +46,22 @@ class LoopbackTransportTests(unittest.TestCase):
                     open_fixed_loopback(req, timeout=3)
             build.assert_not_called()
 
+    def test_fixed_endpoint_rejects_mutated_proxy_and_host(self):
+        from obsession_lab.loopback_http import open_fixed_loopback
+        url='http://127.0.0.1:11434/api/chat'
+        proxied=urllib.request.Request(url,method='POST')
+        proxied.set_proxy('external.invalid:18080','http')
+        self.assertEqual(url,proxied.full_url)
+        forged_host=urllib.request.Request(url,method='POST')
+        forged_host.host='external.invalid:18080'
+        forged_header=urllib.request.Request(url,method='POST')
+        forged_header.add_header('Host','external.invalid')
+        with patch('urllib.request.build_opener') as build:
+            for request in (proxied,forged_host,forged_header):
+                with self.subTest(host=request.host), self.assertRaises(ValueError):
+                    open_fixed_loopback(request,timeout=3)
+            build.assert_not_called()
+
     def test_ollama_does_not_use_ambient_proxy_or_follow_redirect(self):
         body = json.dumps({'model':'qwen3:4b-instruct','done':True,'done_reason':'stop',
             'message':{'role':'assistant','content':'Synthetic answer'}}).encode()
