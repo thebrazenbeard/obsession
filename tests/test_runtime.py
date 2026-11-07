@@ -6,7 +6,7 @@ import unittest
 
 from resident_initiative.runtime import Runtime, SyntheticConfig, canonical
 from pre_active.engine import ModelResponse, RetryableModelError, ToolCall
-from stop_fixture import SyntheticStopAuthority
+from stop_fixture import SyntheticPublishCustodian
 
 
 class Clock:
@@ -35,7 +35,7 @@ class RuntimeTests(unittest.TestCase):
         self.provider = Provider()
         Runtime.initialize(self.db, SyntheticConfig(expires_at=500, max_events=2, interval_seconds=30), now=100)
         self.runtime = Runtime(self.db, self.provider, clock=self.clock)
-        self.stop_authority = SyntheticStopAuthority()
+        self.stop_authority = SyntheticPublishCustodian(self.path / "out")
         self.runtime.stop_authority = self.stop_authority
     def tearDown(self):
         self.runtime.close()
@@ -44,6 +44,9 @@ class RuntimeTests(unittest.TestCase):
         self.runtime.cycle()
         self.runtime.cycle()
         return self.runtime.status()["proposals"]
+    def signed_grant(self, grant):
+        return {**grant, "host_grant_mac": self.stop_authority.operator_sign_for_test(
+            grant["host_grant_request"])}
     def test_timer_produces_proposal_through_real_substrate_without_contact(self):
         proposals = self.finish_first()
         self.assertEqual(len(proposals), 1)
@@ -194,7 +197,7 @@ class RuntimeTests(unittest.TestCase):
             self.runtime.export(proposal["proposal_id"], grant_file, self.path / "out")
         self.assertFalse((self.path / "out").exists())
         grant = self.runtime.grant_local(proposal["proposal_id"], self.path / "out", expires_at=200)
-        grant_file.write_text(canonical(grant))
+        grant_file.write_text(canonical(self.signed_grant(grant)))
         first = self.runtime.export(proposal["proposal_id"], grant_file, self.path / "out")
         second = self.runtime.export(proposal["proposal_id"], grant_file, self.path / "out")
         self.assertEqual(first, second)
@@ -207,7 +210,7 @@ class RuntimeTests(unittest.TestCase):
         proposal = self.finish_first()[0]
         grant = self.runtime.grant_local(proposal["proposal_id"], self.path / "out", expires_at=200)
         grant_file = self.path / "grant.json"
-        grant_file.write_text(canonical(grant))
+        grant_file.write_text(canonical(self.signed_grant(grant)))
         self.runtime.cancel()
         with self.assertRaises(PermissionError):
             self.runtime.export(proposal["proposal_id"], grant_file, self.path / "out")
@@ -217,7 +220,7 @@ class RuntimeTests(unittest.TestCase):
         proposal = self.finish_first()[0]
         grant = self.runtime.grant_local(proposal["proposal_id"], self.path / "out", expires_at=200)
         grant_file = self.path / "grant.json"
-        grant_file.write_text(canonical(grant))
+        grant_file.write_text(canonical(self.signed_grant(grant)))
         corrupted = dict(proposal, message="Corrupted after original grant")
         self.runtime.store.connection.execute("UPDATE initiative_proposals SET body_json=? WHERE proposal_id=?", (canonical(corrupted), proposal["proposal_id"]))
         with self.assertRaises(PermissionError):
