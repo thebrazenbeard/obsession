@@ -1,0 +1,110 @@
+{
+  "pre_active": {
+    "repo": "thebrazenbeard/pre-active",
+    "head": "e306c251a4da44125ee58c311a35120084da8e4b",
+    "files": [
+      {
+        "path": "examples/minimal.py",
+        "sha": "393de3f88b462e3a5dfb5c2c441d65a245ee9242"
+      },
+      {
+        "path": "pyproject.toml",
+        "sha": "cbba442b2bd5dfc321c0ee91f29bc09885a6e10d"
+      },
+      {
+        "path": "src/pre_active/__init__.py",
+        "sha": "d04ff07b632b1a48e2e706c44f2cdaca4449da1f"
+      },
+      {
+        "path": "src/pre_active/__main__.py",
+        "sha": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08"
+      },
+      {
+        "path": "src/pre_active/cli.py",
+        "sha": "9461efac3134857e8a2310f96e7914aa7a747560"
+      },
+      {
+        "path": "src/pre_active/context.py",
+        "sha": "e37ea84eb187589dfc7fff0863c50d6c69dcb294"
+      },
+      {
+        "path": "src/pre_active/contracts.py",
+        "sha": "2bc91aa0c1fc3291865dc9d4320c6b81a441a5f2"
+      },
+      {
+        "path": "src/pre_active/daemon.py",
+        "sha": "f1f501cdc387cdf2320633a320818f4c27b750dc"
+      },
+      {
+        "path": "src/pre_active/empathy_policy.py",
+        "sha": "94883cd84c08862cc2396613cc95a69c5ebaf960"
+      },
+      {
+        "path": "src/pre_active/engine.py",
+        "sha": "0fe7755e7ed01f0548652a43483a44b67c691967"
+      },
+      {
+        "path": "src/pre_active/initiative.py",
+        "sha": "cd578cdc41166acc958ed42844cb5071ec0694d1"
+      },
+      {
+        "path": "src/pre_active/lease.py",
+        "sha": "7ea542401b6b03f14b90e4f6c33e586e0253995f"
+      },
+      {
+        "path": "src/pre_active/model_targets.py",
+        "sha": "64ef4512dc827f8a88f97264de35ec6c602e5621"
+      },
+      {
+        "path": "src/pre_active/observers.py",
+        "sha": "f10ede2ec4d1f1cb3fbf6eccc04c8a13c2c08802"
+      },
+      {
+        "path": "src/pre_active/outcome_correlation.py",
+        "sha": "f794d0e254b31b2d80b20d033813770625b605dd"
+      },
+      {
+        "path": "src/pre_active/outcomes.py",
+        "sha": "2bf0b491f4a10ab215f190053afe4984fa29d038"
+      },
+      {
+        "path": "src/pre_active/progress.py",
+        "sha": "f0cbb48d7c3e9b972134562fd8a333229455b470"
+      },
+      {
+        "path": "src/pre_active/providers/__init__.py",
+        "sha": "0db28d90fb05859691c528e79fd21005fec2400f"
+      },
+      {
+        "path": "src/pre_active/providers/openai_compatible.py",
+        "sha": "4cac121a9219678e6ea716617188ee3df527d88b"
+      },
+      {
+        "path": "src/pre_active/scheduler.py",
+        "sha": "626721701318e228bb7958418435edd93f2dcd19"
+      },
+      {
+        "path": "src/pre_active/store.py",
+        "sha": "d0f9c1efb6a11cc5bff1291c2c2bb851347db0c7"
+      },
+      {
+        "path": "src/pre_active/tools.py",
+        "sha": "d5c91a9646eeddcf28d6d2b6895a18140d78b8e3"
+      },
+      {
+        "path": "src/pre_active/volition_bridge.py",
+        "sha": "e7c0e27c83654990e18f46bce6fab39213134fd0"
+      }
+    ]
+  },
+  "obsession": {
+    "repo": "thebrazenbeard/obsession",
+    "head": "6ed7d325bd33ac49098f4220e0fb7b05ed6d2f64",
+    "files": [
+      {
+        "path": "obsession_lab/goal_focus.py",
+        "sha": "3518c5ea49d40d1f0e90adda98bdeac30381525a"
+      }
+    ]
+  }
+}
