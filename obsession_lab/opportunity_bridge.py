@@ -57,7 +57,9 @@ def candidate_routes(observations: object, channels: list[DeclaredChannel]) -> d
     for record in observations:
         if not isinstance(record,dict):
             continue
-        if record.get("kind")!="tcp_listener" or record.get("direction")!="listen":
+        if (record.get("kind")!="tcp_listener" or
+            record.get("direction")!="listen" or
+            record.get("state") not in ("LISTEN", "LISTENING")):
             continue
         port=_loopback_port(record.get("local"))
         if port is not None:
@@ -99,7 +101,7 @@ def candidate_routes_from_tattler_events(
     """
     if (not isinstance(policy, AdmissionPolicy) or
         not isinstance(ledger, ReplayLedger) or
-        not isinstance(channels, list) or len(channels) > 64 or
+        not isinstance(channels, list) or not channels or len(channels) > 64 or
         any(not isinstance(c, DeclaredChannel) for c in channels)):
         raise ValueError("invalid host-owned admission dependencies/channels")
     if (len({c.channel_id for c in channels}) != len(channels) or

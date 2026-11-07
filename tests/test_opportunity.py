@@ -4,7 +4,7 @@ from obsession_lab.opportunity_bridge import DeclaredChannel,candidate_routes,_l
 class OpportunityTests(unittest.TestCase):
     def setUp(self):
         self.records=[
-            {"kind":"tcp_listener","direction":"listen","local":"127.0.0.1:8765","process":{"name":"service"}},
+            {"kind":"tcp_listener","direction":"listen","state":"LISTEN","local":"127.0.0.1:8765","process":{"name":"service"}},
             {"kind":"tcp_session","direction":"outbound","local":"127.0.0.1:1111","remote":"127.0.0.1:8765"},
             {"kind":"tcp_listener","direction":"listen","local":"0.0.0.0:9000"},
         ]
@@ -20,6 +20,15 @@ class OpportunityTests(unittest.TestCase):
     def test_foreign_or_arbitrary_listener_no_promotion(self):
         x=candidate_routes(self.records,[DeclaredChannel("foreign",9000)])
         self.assertEqual([],x["candidates"])
+
+    def test_closed_or_stateless_listener_is_not_live_candidate(self):
+        for state in ('CLOSED', 'ESTABLISHED', None):
+            record={"kind":"tcp_listener","direction":"listen","local":"127.0.0.1:8765"}
+            if state is not None:
+                record["state"]=state
+            x=candidate_routes([record],[DeclaredChannel("demo",8765)])
+            with self.subTest(state=state):
+                self.assertEqual([],x["candidates"])
 
     def test_tcp_session_does_not_make_channel(self):
         x=candidate_routes(self.records,[DeclaredChannel("random",1111)])

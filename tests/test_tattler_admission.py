@@ -155,6 +155,11 @@ class EventChannelBridgeTests(unittest.TestCase):
             self.run_bridge([DeclaredChannel('not_inventory',4444)])
         self.assertEqual(1,len(self.run_bridge()['candidates']))
 
+    def test_empty_catalog_does_not_consume_event_for_future_channels(self):
+        with self.assertRaises(ValueError):
+            self.run_bridge([])
+        self.assertEqual(1,len(self.run_bridge()['candidates']))
+
     def test_crosswalk_event_replay_yields_no_second_candidate(self):
         self.run_bridge()
         second=self.run_bridge()

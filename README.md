@@ -52,7 +52,7 @@ receipt = simulation.step(Observation("synthetic_001", target_relevance=0.25))
 print(receipt)  # Simulation proxy, not real LLM inference.
 ```
 
-Run the 54-test synthetic/fake-client suite with `python -B -m unittest discover -s tests -v` (verified on Lappy, Windows Python 3.12). The optional fixed-loopback Ollama and Tattler adapters now reject ambient HTTP proxies, redirects, and unknown endpoint/method pairs; neither adapter is a background service. Live Ollama inference is disabled unless its caller explicitly opts in; that does **not** constitute consent for person-directed targets.
+Run the 56-test synthetic/fake-client suite with `python -B -m unittest discover -s tests -v` (verified on Lappy, Windows Python 3.12). The optional fixed-loopback Ollama and Tattler adapters now reject ambient HTTP proxies, redirects, and unknown endpoint/method pairs; neither adapter is a background service. Live Ollama inference is disabled unless its caller explicitly opts in; that does **not** constitute consent for person-directed targets.
 
 An additional **pure, optional Tattler event admission** layer can map caller-supplied `/api/v1/events` records to declared loopback channel candidates using a host-owned policy, clock, and in-process replay ledger. It rejects stale/forged-shape/replayed/public-port events, strips process/remote/owner details, and labels a recent `open` event **not proof of a current listener**. It performs no HTTP fetch, messaging, credential authentication, or execution; its source/host fields remain untrusted claims. Neither a declared outbound flag nor a matching port grants permission.
 
