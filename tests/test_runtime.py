@@ -56,6 +56,20 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(proposals[0]["ttl_seconds"], 400)
         journals = self.runtime.store.list_journal(limit=100)
         self.assertIn("AUTONOMOUS_TURN_GRANTED", [r["event_type"] for r in journals])
+    def test_persisted_active_owner_does_not_attest_live_worker_after_reopen(self):
+        self.runtime.submit_signal("synthetic.one", .95, now=100)
+        self.runtime.submit_signal("synthetic.two", .95, now=100)
+        self.runtime.close()
+        self.runtime = Runtime(self.db, self.provider, clock=self.clock)
+        status = self.runtime.status()
+        self.assertEqual(status["state"], "ACTIVE")
+        self.assertEqual(status["state_subject"], "PERSISTED_TRIAL_OWNER_NOT_PROCESS")
+        self.assertEqual(status["worker_liveness"], "NOT_ATTESTED_BY_DATABASE")
+        self.assertEqual(status["schedule_flag_subject"],
+                         "PERSISTED_CONFIGURATION_NOT_RUNNING_TIMER")
+        self.assertIs(status["schedule_configured_enabled"], True)
+        self.assertEqual(status["observation_budget_remaining"], 0)
+        self.assertFalse(status["contact_authorized"])
     def test_restart_retains_observations_and_no_repeated_proposal(self):
         original = self.finish_first()[0]
         self.runtime.close()

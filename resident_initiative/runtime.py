@@ -489,8 +489,20 @@ class Runtime:
 
     def status(self):
         owner = self._owner()
+        schedule = self.store.connection.execute(
+            "SELECT enabled FROM schedules WHERE id=?", (owner["schedule_id"],)
+        ).fetchone()
+        # `ACTIVE` denotes an eligible persisted trial generation, never a
+        # currently running worker. Neither a schedule flag nor opening this
+        # SQLite database proves that a worker process/timer is alive.
         return {"schema": "initiative.status.v1", "generation": self.generation,
                 "state": owner["state"], "expires_at": self.config.expires_at,
+                "state_subject": "PERSISTED_TRIAL_OWNER_NOT_PROCESS",
+                "worker_liveness": "NOT_ATTESTED_BY_DATABASE",
+                "schedule_configured_enabled": bool(schedule["enabled"]) if schedule is not None else None,
+                "schedule_flag_subject": "PERSISTED_CONFIGURATION_NOT_RUNNING_TIMER",
+                "observation_budget_remaining": max(0, self.config.max_events -
+                    self.store.connection.execute("SELECT COUNT(*) FROM initiative_signals").fetchone()[0]),
                 "config_digest": self.config_digest, "provenance": PROVENANCE,
                 "signals": [dict(r) for r in self.store.connection.execute("SELECT event_id,score_json FROM initiative_signals ORDER BY seq")],
                 "proposals": [json.loads(r["body_json"]) for r in self.store.connection.execute("SELECT body_json FROM initiative_proposals ORDER BY created_at")],
