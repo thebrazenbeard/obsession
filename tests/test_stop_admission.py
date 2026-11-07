@@ -4,7 +4,6 @@ All files, clocks, grants, identities and STOP authorities are disposable and
 synthetic. This does NOT establish protected Windows custody or phone delivery.
 """
 import json
-import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -14,9 +13,9 @@ import unittest
 from unittest import mock
 
 from resident_initiative.runtime import Runtime, SyntheticConfig, canonical
-from resident_initiative.stop_authority import StopAdmission, StopAuthorityUnavailable
+from resident_initiative.stop_authority import StopAuthorityUnavailable
 from pre_active.engine import ModelResponse
-from stop_fixture import SyntheticStopAuthority
+from stop_fixture import SyntheticPublishCustodian
 
 
 class _Clock:
@@ -36,7 +35,7 @@ class StopAdmissionTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.db = self.root / "state.sqlite3"
         self.clock = _Clock()
-        self.witness = SyntheticStopAuthority()
+        self.witness = SyntheticPublishCustodian(self.root / "out")
         Runtime.initialize(self.db, SyntheticConfig(expires_at=500, interval_seconds=30, max_events=2), now=100)
         self.runtime = Runtime(self.db, _Provider(), clock=self.clock, stop_authority=self.witness)
 
@@ -50,6 +49,7 @@ class StopAdmissionTests(unittest.TestCase):
         proposal = self.runtime.status()["proposals"][0]
         target = self.root / "out"
         grant = self.runtime.grant_local(proposal["proposal_id"], target, expires_at=200)
+        grant["host_grant_mac"] = self.witness.operator_sign_for_test(grant["host_grant_request"])
         file = self.root / "grant.json"
         file.write_text(canonical(grant), encoding="utf-8")
         return proposal, file, target
@@ -74,7 +74,7 @@ class StopAdmissionTests(unittest.TestCase):
         shutil.copyfile(snapshot, self.db)
         self.runtime = Runtime(self.db, _Provider(), clock=self.clock, stop_authority=self.witness)
         self.assertEqual(self.runtime.status()["state"], "ACTIVE")  # restored local state lies
-        with self.assertRaisesRegex(StopAuthorityUnavailable, "REVOKED"):
+        with self.assertRaisesRegex(StopAuthorityUnavailable, "TEST_CUSTODIAN_STOPPED"):
             self.runtime.export(proposal["proposal_id"], file, target)
         self.assertFalse(target.exists())
 
@@ -112,7 +112,7 @@ class StopAdmissionTests(unittest.TestCase):
         self.runtime.close()
         self.runtime = None
         shutil.copyfile(snapshot, self.db)
-        lost_history = SyntheticStopAuthority()  # forbidden real-host reset
+        lost_history = SyntheticPublishCustodian(target)  # forbidden real-host reset
         self.runtime = Runtime(self.db, _Provider(), clock=self.clock,
                                stop_authority=lost_history)
         result = self.runtime.export(proposal["proposal_id"], file, target)
@@ -121,23 +121,22 @@ class StopAdmissionTests(unittest.TestCase):
 
     def test_stale_wrong_generation_divergent_and_outage_fail_closed(self):
         proposal, file, target = self.ready_grant()
-        valid = self.runtime.generation
-        cases = [
-            StopAdmission("wrong-gen", 0, 130, "LOCAL_SYNTHETIC_HANDOFF_ONLY", "ACTIVE"),
-            StopAdmission(valid, 0, 100, "LOCAL_SYNTHETIC_HANDOFF_ONLY", "ACTIVE"),
-            StopAdmission(valid, 0, 130, "CONTACT", "ACTIVE"),
-            StopAdmission(valid, 0, 130, "LOCAL_SYNTHETIC_HANDOFF_ONLY", "REVOKED"),
-            StopAdmission(valid, -1, 130, "LOCAL_SYNTHETIC_HANDOFF_ONLY", "ACTIVE"),
+        good = json.loads(file.read_text())
+        invalids = [
+            {**good, "host_grant_mac": "0" * 64},
+            {**good, "host_grant_request": {**good["host_grant_request"], "generation": "wrong"}},
+            {**good, "host_grant_request": {**good["host_grant_request"], "scope": "CONTACT"}},
+            {**good, "host_grant_request": {**good["host_grant_request"], "source_digest": "f" * 64}},
         ]
-        for invalid in cases:
-            with self.subTest(invalid=invalid):
-                self.witness.override = invalid
-                with self.assertRaises(StopAuthorityUnavailable):
+        for index, invalid in enumerate(invalids):
+            with self.subTest(index=index):
+                file.write_text(canonical(invalid), encoding="utf-8")
+                with self.assertRaises((StopAuthorityUnavailable, PermissionError)):
                     self.runtime.export(proposal["proposal_id"], file, target)
                 self.assertFalse(target.exists())
-        self.witness.override = None
+        file.write_text(canonical(good), encoding="utf-8")
         self.witness.error = True
-        with self.assertRaisesRegex(StopAuthorityUnavailable, "STOP_AUTHORITY_ERROR"):
+        with self.assertRaisesRegex(StopAuthorityUnavailable, "TEST_CUSTODIAN_STOPPED"):
             self.runtime.export(proposal["proposal_id"], file, target)
         self.assertFalse(target.exists())
 
@@ -146,14 +145,16 @@ class StopAdmissionTests(unittest.TestCase):
         entered = threading.Event()
         release = threading.Event()
         stopped = threading.Event()
-        original = os.link
+        original = self.witness.publish_local
         failures = []
 
-        def blocked_link(*args, **kwargs):
-            entered.set()
-            if not release.wait(timeout=3):
-                raise TimeoutError("fixture did not release link")
-            return original(*args, **kwargs)
+        def blocked_publish(*args, **kwargs):
+            # Host-owned serialized final publication; no client os.link path.
+            with self.witness.lock:
+                entered.set()
+                if not release.wait(timeout=3):
+                    raise TimeoutError("fixture did not release publish")
+                return original(*args, **kwargs)
 
         def exporter():
             try:
@@ -170,13 +171,13 @@ class StopAdmissionTests(unittest.TestCase):
             self.witness.revoke(generation=self.runtime.generation, now=100)
             stopped.set()
 
-        with mock.patch("resident_initiative.gate.os.link", side_effect=blocked_link):
+        with mock.patch.object(self.witness, "publish_local", side_effect=blocked_publish):
             t_export = threading.Thread(target=exporter)
             t_export.start()
             self.assertTrue(entered.wait(timeout=3), "final publication seam was never reached")
             t_stop = threading.Thread(target=stopper)
             t_stop.start()
-            self.assertFalse(stopped.wait(timeout=.15), "STOP acknowledged during held publication lease")
+            self.assertFalse(stopped.wait(timeout=.15), "STOP acknowledged during host publication")
             release.set()
             t_export.join(timeout=3)
             t_stop.join(timeout=3)

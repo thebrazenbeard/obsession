@@ -7,36 +7,34 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
-import tempfile
 import uuid
-from functools import wraps
 
 from .runtime import CommitDenial, Runtime, canonical, digest, finite
 from .deps import PROVENANCE
-from .stop_authority import require_stop_admission
+from .stop_authority import StopAuthorityUnavailable
 from pre_active.engine import ModelResponse
-
-
-def _requires_independent_stop(method):
-    """Hold STOP serialization until the local publication returns.
-
-    This deliberately rejects old CLI callers without an approved, protected
-    STOP provider. A cached allow decision is not sufficient.
-    """
-    @wraps(method)
-    def wrapped(self, *args, now=None, **kwargs):
-        stamp = self.runtime.clock() if now is None else now
-        with require_stop_admission(getattr(self.runtime, "stop_authority", None),
-                                    generation=self.runtime.generation, now=stamp):
-            return method(self, *args, now=stamp, **kwargs)
-    return wrapped
 
 
 class LocalHandoffGate:
     def __init__(self, runtime):
         self.runtime = runtime
+
+    @staticmethod
+    def _handoff_payload(row, proposal):
+        """One stable output encoding used both before signing and at publish."""
+        return (canonical({"schema": "initiative.local-handoff.v1",
+                           "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY",
+                           "proposal_digest": row["proposal_digest"], "proposal": proposal,
+                           "delivery_verified": False, "contact_authorized": False}) + "\n").encode("utf-8")
+
+    def _publisher(self, directory):
+        custodian = getattr(self.runtime, "stop_authority", None)
+        if custodian is None or not callable(getattr(custodian, "publish_local", None)):
+            raise StopAuthorityUnavailable("PROTECTED_HOST_PUBLISHER_UNAVAILABLE")
+        if Path(directory).resolve() != Path(getattr(custodian, "output_root", "")).resolve():
+            raise StopAuthorityUnavailable("LOCAL_DIRECTORY_NOT_CUSTODIAN_PROTECTED_ROOT")
+        return custodian
 
     def _verified_proposal(self, row, now):
         """Readback actual bytes; a stored digest claim is not verification."""
@@ -81,11 +79,15 @@ class LocalHandoffGate:
                                  {"reason": "PROPOSAL_INTEGRITY_FAILURE"}, now)
             raise CommitDenial("stored proposal failed fresh integrity verification") from exc
 
-    @_requires_independent_stop
     def authorize(self, proposal_id, directory, *, expires_at, now=None):
-        """Explicit owner CLI/API action. It grants only local file export."""
+        """Stage a local candidate grant; only host operator can sign it.
+
+        This SQLite record is not final publication authority. PUBLISH requires
+        a separately issued operator-HMAC grant from protected host custody.
+        """
         now = self.runtime.clock() if now is None else now
         directory = str(Path(directory).resolve())
+        self._publisher(directory)
         with self.runtime.transaction():
             reason = self.runtime._hold_reason(self.runtime._owner(), now)
             if reason:
@@ -93,24 +95,36 @@ class LocalHandoffGate:
             row = self.runtime.store.connection.execute("SELECT * FROM initiative_proposals WHERE proposal_id=?", (proposal_id,)).fetchone()
             if row is None:
                 raise KeyError("proposal does not exist")
-            self._verified_proposal(row, now)
+            proposal = self._verified_proposal(row, now)
             if not now < finite(expires_at, "grant expiry") <= min(self.runtime.config.expires_at, now + 3600):
                 raise ValueError("local grant expiry must be fresh and bounded")
             grant_id = str(uuid.uuid4())
             self.runtime.store.connection.execute("INSERT INTO initiative_local_grants VALUES(?,?,?,?,?,?,NULL,NULL)",
                                           (grant_id, proposal_id, row["proposal_digest"], self.runtime.generation, directory, expires_at))
+        host_grant_request = {"generation": self.runtime.generation,
+                              "artifact_id": proposal_id.removeprefix("sha256:"),
+                              "source_digest": hashlib.sha256(self._handoff_payload(row, proposal)).hexdigest(),
+                              "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY",
+                              "expires_at": float(expires_at)}
         return {"schema": "initiative.local-grant.v1", "grant_id": grant_id,
                 "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY", "proposal_id": proposal_id,
                 "proposal_digest": row["proposal_digest"], "generation": self.runtime.generation,
-                "directory": directory, "expires_at": expires_at, "contact_authorized": False}
+                "directory": directory, "expires_at": expires_at, "contact_authorized": False,
+                "host_grant_request": host_grant_request}
 
-    @_requires_independent_stop
     def export(self, proposal_id, grant_path, directory, *, now=None):
+        """Publish only through a separately protected host custodian.
+
+        This process may read/check its SQLite state, but it never writes the
+        final artifact. A local lease and os.link would be bypassable by a
+        resident principal that can write the target directory directly.
+        """
         now = self.runtime.clock() if now is None else now
         grant_file = json.loads(Path(grant_path).read_text(encoding="utf-8"))
         if type(grant_file) is not dict or grant_file.get("scope") != "LOCAL_SYNTHETIC_HANDOFF_ONLY":
             raise PermissionError("explicit local synthetic grant required")
         target_directory = Path(directory).resolve()
+        custodian = self._publisher(target_directory)
         with self.runtime.transaction():
             reason = self.runtime._hold_reason(self.runtime._owner(), now)
             if reason:
@@ -122,36 +136,36 @@ class LocalHandoffGate:
             if (grant is None or row is None or grant["proposal_id"] != proposal_id
                     or grant["generation"] != self.runtime.generation or grant["proposal_digest"] != row["proposal_digest"]
                     or grant["directory"] != str(target_directory) or grant["expires_at"] <= now
-                    or grant_file.get("proposal_digest") != row["proposal_digest"]):
+                    or grant_file.get("proposal_digest") != row["proposal_digest"]
+                    or grant_file.get("proposal_id") != proposal_id
+                    or grant_file.get("generation") != self.runtime.generation
+                    or grant_file.get("directory") != str(target_directory)
+                    or grant_file.get("expires_at") != grant["expires_at"]):
                 self.runtime._record(proposal_id, "REJECTED_LOCAL_HANDOFF", {"reason": "MISSING_OR_INVALID_HOST_GRANT"}, now)
                 raise CommitDenial("local handoff grant is invalid")
-            target_directory.mkdir(parents=True, exist_ok=True)
-            target = target_directory / (proposal_id.removeprefix("sha256:") + ".json")
-            payload = (canonical({"schema": "initiative.local-handoff.v1", "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY",
-                                  "proposal_digest": row["proposal_digest"], "proposal": proposal,
-                                  "delivery_verified": False, "contact_authorized": False}) + "\n").encode("utf-8")
-            if target.exists():
-                if target.read_bytes() != payload:
-                    raise RuntimeError("divergent local handoff artifact; no overwrite")
-            else:
-                handle, temporary = tempfile.mkstemp(prefix=".initiative-", dir=target_directory)
-                try:
-                    with os.fdopen(handle, "wb") as output:
-                        output.write(payload)
-                        output.flush()
-                        os.fsync(output.fileno())
-                    # Atomic no-replace publication. A crash can leave a complete
-                    # artifact, reused only after exact readback on safe retry.
-                    if os.name == "nt":
-                        # Windows rename is atomic and refuses existing targets.
-                        os.rename(temporary, target)
-                    else:
-                        os.link(temporary, target)
-                finally:
-                    if os.path.exists(temporary):
-                        os.unlink(temporary)
-            self.runtime.store.connection.execute("UPDATE initiative_local_grants SET used_at=COALESCE(used_at,?),artifact_path=? WHERE grant_id=?", (now, str(target), grant["grant_id"]))
-            self.runtime._record(proposal_id, "LOCAL_HANDOFF_EXPORTED", {"path_digest": digest(str(target)), "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY"}, now)
-            return {"path": str(target), "sha256": hashlib.sha256(payload).hexdigest(),
+            payload = self._handoff_payload(row, proposal)
+            # An operator must independently sign this exact host-bound grant.
+            # No resident code may mint a protected grant MAC itself.
+            artifact_id = proposal_id.removeprefix("sha256:")
+            source_digest = hashlib.sha256(payload).hexdigest()
+            host_grant = {"generation": self.runtime.generation,
+                          "artifact_id": artifact_id,
+                          "source_digest": source_digest,
+                          "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY",
+                          "expires_at": float(grant["expires_at"])}
+            if grant_file.get("host_grant_request") != host_grant:
+                raise StopAuthorityUnavailable("HOST_GRANT_BINDING_MISMATCH")
+            receipt = custodian.publish_local(
+                generation=self.runtime.generation,
+                artifact_id=artifact_id,
+                source_digest=source_digest,
+                payload=payload,
+                grant=host_grant,
+                grant_mac=grant_file.get("host_grant_mac"),
+                now=now)
+            target = str(receipt["path"])
+            self.runtime.store.connection.execute("UPDATE initiative_local_grants SET used_at=COALESCE(used_at,?),artifact_path=? WHERE grant_id=?", (now, target, grant["grant_id"]))
+            self.runtime._record(proposal_id, "LOCAL_HANDOFF_EXPORTED", {"path_digest": digest(target), "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY"}, now)
+            return {"path": target, "sha256": hashlib.sha256(payload).hexdigest(),
                     "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY", "contact_authorized": False, "delivery_verified": False}
 
