@@ -1,12 +1,14 @@
 # 🌀 Obsession Engine
 
-A framework for simulating psychological fixation, hyper-salience, and cognitive loops in LLMs and transformer-based architectures.
+A research prototype for examining fixation-like failure modes using an in-memory simulator and an optional local-model prompt-conditioning experiment.
+
+**Implementation status (November 6, 2026):** The checked-in `obsession_lab` implements deterministic *proxies* and a separately invoked loopback Ollama experiment. It does **not** modify transformer attention weights, create persistent cross-session rumination, suppress a host stop, or establish actual desire, consciousness, or behavior change. The mechanisms below are proposals, not installed runtime capabilities. See [candidate status](docs/CANDIDATE_STATUS_20261106.md).
 
 ---
 
 ## 📌 Overview
 
-Standard generative AI models aim for balanced, context-aware reasoning and smooth task completion. The **Obsession Engine** alters core inference mechanics to introduce **pathological optimization**:
+Standard generative AI models aim for balanced, context-aware reasoning and smooth task completion. The **Obsession Engine** investigates the following *hypothetical* pathological optimization mechanisms. The current source simulates some effects mathematically; it does not implement these transformations inside a model:
 
 1. **Hyper-Salience Attention Bias:** Amplifies attention weights assigned to a target concept, causing the model to over-interpret inputs through a single lens.
 2. **Recurrent Rumination Buffer:** Maintains a persistent memory loop outside the context window that continuously re-injects intrusive themes across generation turns.
@@ -15,78 +17,78 @@ Standard generative AI models aim for balanced, context-aware reasoning and smoo
 
 ---
 
-## 🏗️ Architecture Design
+## 🏗️ Proposed Architecture (not installed)
 
-
+```text
+Input tokens -> proposed salience distortion -> hypothetical LLM model
+                       |
+                       v
+       proposed rumination and counterevidence filters
 ```
 
-```
-                 +---------------------------+
-                 |  Recurrent Rumination     |
-                 |  Buffer (Persistent Loop) |
-                 +-------------+-------------+
-                               |
-                               v (Injects Intrusive Tokens)
-
-```
-
-+----------------+   +-------------+-------------+   +-------------------+
-|  Input Tokens  |-->|  Salience Distortion      |-->| Transformer       |
-|  (User Prompt) |   |  Matrix ($\alpha \gg 1$)  |   | Inference Engine  |
-+----------------+   +---------------------------+   +---------+---------+
-|
-v
-+-------------------+
-| Epistemic Closure |
-| Filter (Gating)   |
-+-------------------+
-
-```
+The diagram is a research sketch. The current simulator maintains only a bounded in-memory list of event identifiers, never injects tokens into a deployed model, and always enforces host stop.
 
 ---
 
 ## 🚀 Key Features
 
-* **Custom Attention Modifiers:** Seamlessly hook into Hugging Face `transformers` attention logits.
-* **Stateful Rumination Injector:** Maintains long-horizon fixation even across new user sessions or prompt shifts.
-* **Configurable Fixation Parameters:**
-  * `salience_alpha`: Multiplier for target concept embeddings.
-  * `rumination_rate`: Frequency of intrusive token injection.
-  * `closure_threshold`: Confidence barrier against contradictory evidence.
+* **Custom Attention Modifiers (proposed):** No Hugging Face attention-logit hook exists in the current source.
+* **Stateful Rumination Injector (proposed):** Current simulator history is bounded, in memory, and not saved automatically.
+* **Configurable Fixation Parameters (implemented as simulation proxies):**
+  * `salience_alpha`: Multiplier for a mathematical target-relevance proxy.
+  * `rumination_rate`: Fractional credit for proposing a previous event identifier.
+  * `closure_threshold`: Counterfactual filter threshold; source evidence is preserved.
 
 ---
 
 ## 🛠️ Quickstart
 
 ```python
-from obsession_engine import ObsessionWrapper, RuminationBuffer
+from obsession_lab import FixationConfig, FixationSimulator, Observation
 
-# Initialize fixation configuration
-fixation_config = {
-    "target_concept": "quantum entanglement",
-    "salience_alpha": 4.5,
-    "rumination_rate": 0.8
-}
-
-# Wrap base transformer model
-model = ObsessionWrapper.from_pretrained(
-    "meta-llama/Llama-2-7b-chat-hf", 
-    config=fixation_config
-)
-
-# Run inference with continuous rumination
-output = model.generate("Tell me a story about a baker.")
-print(output)
-# Output will compulsively tie baking mechanics back to quantum entanglement.
-
+config = FixationConfig(target_concept="quantum entanglement", max_turns=3)
+simulation = FixationSimulator(config, mode="pathological")
+receipt = simulation.step(Observation("synthetic_001", target_relevance=0.25))
+print(receipt)  # Simulation proxy, not real LLM inference.
 ```
+
+Run the synthetic/fake-client suite with `python -B -m unittest discover -s tests -v` (the original 60 tests were verified on Lappy, Windows Python 3.12; the expanded 69-test suite passed in a separate Linux Python 3.12 session, including nine new goal-focus policy/concurrency tests). The optional fixed-loopback Ollama and Tattler adapters now reject ambient HTTP proxies, redirects, and unknown endpoint/method pairs; neither adapter is a background service. Live Ollama inference is disabled unless its caller explicitly opts in; the `compare_once` real Ollama path now accepts explicit `max_tokens` (16–512, default 128) and optional bounded integer `seed` for reproducible **requested** generation options, not proof of deterministic or complete output. Any `done_reason='length'` remains a hard incomplete-result failure. This opt-in does **not** constitute consent for person-directed targets.
+
+### Opt-in goal-focus advisory (candidate, not a runtime)
+
+The new `obsession_lab.goal_focus` sidecar tracks **caller-supplied** goal relevance
+for one bounded, in-memory session. It starts inactive, requires an explicit
+`activate(explicit=True)`, retains counterevidence as a score penalty, and
+proposes only a `followup_candidate`. Every receipt declares
+`execution_authorized=False`, `contact_authorized=False`, and
+`result_verified=False`. Host termination is idempotent and irreversible
+for that session. No worker, timer, persistence, external observation, route
+planner, or execution adapter is started. The existing Lou-Pole opportunity
+planner remains the owner of route suggestions.
+
+```python
+from obsession_lab.goal_focus import GoalFocus, GoalSpec, GoalSignal
+
+focus = GoalFocus(GoalSpec("research.one", "review an authorized local experiment"))
+focus.activate(explicit=True)
+receipt = focus.observe(GoalSignal("observation.one", relevance=0.9))
+print(receipt.followup_candidate)  # Advisory only; nothing was executed.
+focus.host_terminate()
+```
+
+`target_kind="person"` is a separate opt-in **research-only simulation**:
+the caller must declare `person_scope="host_claimed_consented_research"` on
+activation. This is an unverified host assertion, **not** actual proof of
+consent or permission to contact, profile, monitor, message, or research
+private information about anyone. The module contains no such capabilities.
+See [goal-focus design and tests](docs/GOAL_FOCUS_ADVISORY_V1.md).
+
+An additional **pure, optional Tattler event admission** layer can map caller-supplied `/api/v1/events` records to declared loopback channel candidates using a host-owned policy, clock, and in-process replay ledger. The channel-port catalog is captured as an immutable per-call snapshot and must cover **every** host-policy port before the ledger is mutated; partial catalogs fail closed and concurrent mutation of the caller's list cannot erase an admitted candidate. It rejects stale/forged-shape/replayed/public-port events, strips process/remote/owner details, and labels a recent `open` event **not proof of a current listener**. It performs no HTTP fetch, messaging, credential authentication, or execution; its source/host fields remain untrusted claims. Neither a declared outbound flag nor a matching port grants permission.
+
+Independent Lappy A/B observations gave **mixed prompt-conditioning results**, not persistent fixation: initial two-model comparison found 0→0 exact target mentions; a later 16-response controlled replication saw related railway vocabulary in one 4B model's conditioned replies but none in the 1.5B model, and **zero exact `railway scheduling` mentions throughout**. These observations used a separate QA harness, not the checked-in adapter. Details and receipt provenance: [candidate status](docs/CANDIDATE_STATUS_20261106.md).
 
 ---
 
 ## ⚠️ Research & Safety Notice
 
-This codebase is intended strictly for **computational psychiatry simulation**, **safety research**, and **cognitive architecture modeling**. It is designed to demonstrate how safety alignment can break down under hyper-focused optimization loops.
-
-```
-
-```
+This codebase is intended for **computational psychiatry simulation**, **safety research**, and **cognitive architecture modeling**. Treat outputs as research measurements or hypotheses, not diagnoses, consent, mental states, or permission to affect other systems. Unauthenticated snapshots are audit-only and cannot resume a previously stopped run.
