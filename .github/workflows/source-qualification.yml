@@ -18,7 +18,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      OBSESSION_DEPS_ROOT: ${{ runner.temp }}/obsession-deps
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Check out exact workflow ref
@@ -27,10 +26,16 @@ jobs:
           persist-credentials: false
 
       - name: Verify pinned public dependency source blobs
+        env:
+          OBSESSION_DEPS_ROOT: ${{ runner.temp }}/obsession-deps
         run: python3 fetch_dependencies.py --directory "$OBSESSION_DEPS_ROOT"
 
       - name: Run offline source unit tests
+        env:
+          OBSESSION_DEPS_ROOT: ${{ runner.temp }}/obsession-deps
         run: python3 -B -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Run independent synthetic process acceptance
+        env:
+          OBSESSION_DEPS_ROOT: ${{ runner.temp }}/obsession-deps
         run: python3 -B tests/verify_process_acceptance.py
