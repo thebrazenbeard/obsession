@@ -101,19 +101,24 @@ def candidate_routes_from_tattler_events(
     """
     if (not isinstance(policy, AdmissionPolicy) or
         not isinstance(ledger, ReplayLedger) or
-        not isinstance(channels, list) or not channels or len(channels) > 64 or
-        any(not isinstance(c, DeclaredChannel) for c in channels)):
+        not isinstance(channels, list)):
         raise ValueError("invalid host-owned admission dependencies/channels")
+    # Snapshot the caller's mutable list before validation/admission/iteration.
+    # Concurrent catalog mutation must not consume an event without mapping it.
+    channel_snapshot = tuple(channels)
+    if (not channel_snapshot or len(channel_snapshot) > 64 or
+        any(not isinstance(c, DeclaredChannel) for c in channel_snapshot)):
+        raise ValueError("invalid host-owned channel snapshot")
     # Bind the ledger to a complete host channel-port catalog. A partial
     # catalog would consume an unmatched event; after a catalog update, that
     # very same observation would be suppressed as replay and silently lost.
-    if (len({c.channel_id for c in channels}) != len(channels) or
-        {c.local_port for c in channels} != policy.declared_local_ports):
+    if (len({c.channel_id for c in channel_snapshot}) != len(channel_snapshot) or
+        {c.local_port for c in channel_snapshot} != policy.declared_local_ports):
         raise ValueError("channel inventory conflicts with host policy")
     admitted = admit_tattler_events(events, policy=policy, ledger=ledger, now=now)
     matches = []
     for recent in admitted["candidate_events"]:
-        for channel in channels:
+        for channel in channel_snapshot:
             if channel.local_port == recent["port"]:
                 matches.append({
                     "channel_id": channel.channel_id, "event_id": recent["event_id"],

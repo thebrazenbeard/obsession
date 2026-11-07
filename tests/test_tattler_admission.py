@@ -1,6 +1,7 @@
 """Threat-driven, synthetic tests against Tattler's published event JSON contract."""
 import copy
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone, timedelta
 
 from obsession_lab.tattler_admission import AdmissionPolicy, ReplayLedger, admit_tattler_events
@@ -175,6 +176,23 @@ class EventChannelBridgeTests(unittest.TestCase):
         self.assertEqual(1,len(outcome['candidates']))
         self.assertEqual('target_port',outcome['candidates'][0]['channel_id'])
         self.assertEqual(0,outcome['replay_count'])
+
+    def test_caller_mutation_during_admission_cannot_poison_channel_mapping(self):
+        channels=[DeclaredChannel('target',9147)]
+        def clear_during_admission(events,*,policy,ledger,now):
+            channels.clear()
+            return admit_tattler_events(events,policy=policy,ledger=ledger,now=now)
+        with patch('obsession_lab.opportunity_bridge.admit_tattler_events',
+                   side_effect=clear_during_admission):
+            result=candidate_routes_from_tattler_events([copy.deepcopy(EVENT)],
+                channels,policy=self.policy,ledger=self.ledger,now=NOW)
+        self.assertEqual('target',result['candidates'][0]['channel_id'])
+        self.assertEqual([],channels)
+        replay=candidate_routes_from_tattler_events([copy.deepcopy(EVENT)],
+            [DeclaredChannel('target',9147)],policy=self.policy,
+            ledger=self.ledger,now=NOW)
+        self.assertEqual(1,replay['replay_count'])
+        self.assertEqual([],replay['candidates'])
 
     def test_crosswalk_event_replay_yields_no_second_candidate(self):
         self.run_bridge()
