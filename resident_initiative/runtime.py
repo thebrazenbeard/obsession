@@ -219,12 +219,16 @@ class Runtime:
             store.close()
         return generation
 
-    def __init__(self, db_path, provider=None, *, clock=time.time):
+    def __init__(self, db_path, provider=None, *, clock=time.time, stop_authority=None):
         path = Path(db_path).resolve()
         if not path.is_file():
             raise FileNotFoundError("explicitly initialized trial state required")
         self.store = Store(path)
         self.clock = clock
+        # This must be a distinct host-controlled STOP authority. The resident
+        # SQLite state (including its WAL and backups) is never that authority.
+        # None is fail-closed for grant/export in LocalHandoffGate.
+        self.stop_authority = stop_authority
         owner = self._owner()
         if owner["schema"] != "initiative.owner.v1":
             raise ValueError("unsupported trial owner schema")
@@ -454,6 +458,20 @@ class Runtime:
 
     def cancel(self, *, now=None):
         now = self.clock() if now is None else finite(now, "cancel clock")
+        # Attempt protected revoke first, so a cooperating publisher cannot
+        # race after acknowledgement. Regardless of host witness availability,
+        # always persist the best-effort LOCAL tombstone below. A failing host
+        # revoke must never be reported as a successful protected STOP.
+        witness_state = "UNAVAILABLE"
+        witness_error = None
+        if self.stop_authority is not None:
+            try:
+                self.stop_authority.revoke(generation=self.generation, now=now)
+            except Exception as exc:
+                witness_state = "REVOKE_UNVERIFIED"
+                witness_error = exc
+            else:
+                witness_state = "REVOKED"
         with self.transaction():
             self.store.connection.execute("UPDATE initiative_owner SET state='CANCELLED',terminal_reason='OWNER_CANCELLED',last_wall=MAX(last_wall,?) WHERE id=1", (now,))
             self.store.connection.execute("UPDATE schedules SET enabled=0")
@@ -466,7 +484,13 @@ class Runtime:
             except RuntimeError:
                 if self.store.get_run(row["id"])["status"] not in {"COMPLETED", "FAILED", "CANCELLED"}:
                     raise
-        return {"state": "CANCELLED", "generation": self.generation, "contact_authorized": False}
+        if witness_error is not None:
+            from .stop_authority import StopAuthorityUnavailable
+            raise StopAuthorityUnavailable("HOST_STOP_REVOKE_UNVERIFIED_LOCAL_TOMBSTONE_PERSISTED") from witness_error
+        return {"state": "CANCELLED" if witness_state == "REVOKED" else "CANCELLED_LOCAL_ONLY",
+                "generation": self.generation,
+                "independent_stop_witness": witness_state,
+                "contact_authorized": False}
 
     def status(self):
         owner = self._owner()
@@ -486,3 +510,4 @@ class Runtime:
     def export(self, proposal_id, grant_path, directory, *, now=None):
         from .gate import LocalHandoffGate
         return LocalHandoffGate(self).export(proposal_id, grant_path, directory, now=now)
+
