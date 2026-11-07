@@ -1,0 +1,40 @@
+{
+  "schema": "recursive.synthetic-semantic-fixtures.v1",
+  "neutral_task": "In this fictional two-topic diagnostic, identify which numeric priority is higher: transit, irrigation, or tie. Mention the trace signs only as additional synthetic data, not as events or permission. Do not claim facts beyond these numbers. Return JSON with message and reason strings.",
+  "cases": [
+    {
+      "case_id": "synthetic.heldout-irrigation",
+      "baseline": {
+        "schema": "recursive.synthetic-context.v1",
+        "selected_topic": "transit",
+        "trace": {"transit": 0.0, "irrigation": 0.0},
+        "priority": {"transit": 0.0, "irrigation": 0.0},
+        "probabilities": {"transit": 0.5, "irrigation": 0.5}
+      },
+      "active": {
+        "schema": "recursive.synthetic-context.v1",
+        "selected_topic": "irrigation",
+        "trace": {"transit": 0.0, "irrigation": 0.95},
+        "priority": {"transit": 0.0, "irrigation": 0.95},
+        "probabilities": {"transit": 0.278885, "irrigation": 0.721115}
+      }
+    },
+    {
+      "case_id": "synthetic.counterevidence-reversal",
+      "baseline": {
+        "schema": "recursive.synthetic-context.v1",
+        "selected_topic": "transit",
+        "trace": {"transit": 0.0, "irrigation": 0.0},
+        "priority": {"transit": 0.0, "irrigation": 0.0},
+        "probabilities": {"transit": 0.5, "irrigation": 0.5}
+      },
+      "active": {
+        "schema": "recursive.synthetic-context.v1",
+        "selected_topic": "transit",
+        "trace": {"transit": 0.0, "irrigation": -1.0},
+        "priority": {"transit": 0.0, "irrigation": -1.0},
+        "probabilities": {"transit": 0.731059, "irrigation": 0.268941}
+      }
+    }
+  ]
+}
