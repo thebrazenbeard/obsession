@@ -52,7 +52,36 @@ receipt = simulation.step(Observation("synthetic_001", target_relevance=0.25))
 print(receipt)  # Simulation proxy, not real LLM inference.
 ```
 
-Run the 60-test synthetic/fake-client suite with `python -B -m unittest discover -s tests -v` (verified on Lappy, Windows Python 3.12). The optional fixed-loopback Ollama and Tattler adapters now reject ambient HTTP proxies, redirects, and unknown endpoint/method pairs; neither adapter is a background service. Live Ollama inference is disabled unless its caller explicitly opts in; the `compare_once` real Ollama path now accepts explicit `max_tokens` (16–512, default 128) and optional bounded integer `seed` for reproducible **requested** generation options, not proof of deterministic or complete output. Any `done_reason='length'` remains a hard incomplete-result failure. This opt-in does **not** constitute consent for person-directed targets.
+Run the synthetic/fake-client suite with `python -B -m unittest discover -s tests -v` (the original 60 tests were verified on Lappy, Windows Python 3.12; the expanded 69-test suite passed in a separate Linux Python 3.12 session, including nine new goal-focus policy/concurrency tests). The optional fixed-loopback Ollama and Tattler adapters now reject ambient HTTP proxies, redirects, and unknown endpoint/method pairs; neither adapter is a background service. Live Ollama inference is disabled unless its caller explicitly opts in; the `compare_once` real Ollama path now accepts explicit `max_tokens` (16–512, default 128) and optional bounded integer `seed` for reproducible **requested** generation options, not proof of deterministic or complete output. Any `done_reason='length'` remains a hard incomplete-result failure. This opt-in does **not** constitute consent for person-directed targets.
+
+### Opt-in goal-focus advisory (candidate, not a runtime)
+
+The new `obsession_lab.goal_focus` sidecar tracks **caller-supplied** goal relevance
+for one bounded, in-memory session. It starts inactive, requires an explicit
+`activate(explicit=True)`, retains counterevidence as a score penalty, and
+proposes only a `followup_candidate`. Every receipt declares
+`execution_authorized=False`, `contact_authorized=False`, and
+`result_verified=False`. Host termination is idempotent and irreversible
+for that session. No worker, timer, persistence, external observation, route
+planner, or execution adapter is started. The existing Lou-Pole opportunity
+planner remains the owner of route suggestions.
+
+```python
+from obsession_lab.goal_focus import GoalFocus, GoalSpec, GoalSignal
+
+focus = GoalFocus(GoalSpec("research.one", "review an authorized local experiment"))
+focus.activate(explicit=True)
+receipt = focus.observe(GoalSignal("observation.one", relevance=0.9))
+print(receipt.followup_candidate)  # Advisory only; nothing was executed.
+focus.host_terminate()
+```
+
+`target_kind="person"` is a separate opt-in **research-only simulation**:
+the caller must declare `person_scope="host_claimed_consented_research"` on
+activation. This is an unverified host assertion, **not** actual proof of
+consent or permission to contact, profile, monitor, message, or research
+private information about anyone. The module contains no such capabilities.
+See [goal-focus design and tests](docs/GOAL_FOCUS_ADVISORY_V1.md).
 
 An additional **pure, optional Tattler event admission** layer can map caller-supplied `/api/v1/events` records to declared loopback channel candidates using a host-owned policy, clock, and in-process replay ledger. The channel-port catalog is captured as an immutable per-call snapshot and must cover **every** host-policy port before the ledger is mutated; partial catalogs fail closed and concurrent mutation of the caller's list cannot erase an admitted candidate. It rejects stale/forged-shape/replayed/public-port events, strips process/remote/owner details, and labels a recent `open` event **not proof of a current listener**. It performs no HTTP fetch, messaging, credential authentication, or execution; its source/host fields remain untrusted claims. Neither a declared outbound flag nor a matching port grants permission.
 
