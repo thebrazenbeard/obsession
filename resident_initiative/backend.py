@@ -25,10 +25,56 @@ import time
 MAX_REQUEST = 18000
 MAX_RESPONSE = 32768
 SCHEMA = "INITIATIVE_BACKEND_V1"
+DIAGNOSTIC_SCHEMA = "OLLAMA_FAILURE_DIAGNOSTIC_V1"
+OLLAMA_FAILURES = frozenset({"transport", "http_status", "invalid_json",
+    "invalid_envelope", "unfinished_or_tools", "invalid_text"})
 
 
 class BackendError(RuntimeError):
     """A bounded inference failure, never an authorization disposition."""
+
+
+class OllamaDiagnosticFailure(BackendError):
+    """Only non-content metadata may cross the authenticated broker boundary."""
+
+    def __init__(self, diagnostic):
+        self.diagnostic = _validate_diagnostic(diagnostic)
+        super().__init__("ollama_" + self.diagnostic["category"])
+
+
+def _validate_diagnostic(value):
+    """Strictly pin every field before displaying data from a signed 502."""
+    expected = {"schema", "category", "elapsed_ms", "http_status", "done_reason",
+                "content_present", "thinking_present", "response_bytes"}
+    if type(value) is not dict or set(value) != expected or value["schema"] != DIAGNOSTIC_SCHEMA:
+        raise BackendError("invalid_broker_diagnostic")
+    if type(value["category"]) is not str or value["category"] not in OLLAMA_FAILURES:
+        raise BackendError("invalid_broker_diagnostic")
+    if type(value["elapsed_ms"]) is not int or not 0 <= value["elapsed_ms"] <= 120000:
+        raise BackendError("invalid_broker_diagnostic")
+    if value["http_status"] is not None and (type(value["http_status"]) is not int or not 100 <= value["http_status"] <= 599):
+        raise BackendError("invalid_broker_diagnostic")
+    if value["done_reason"] not in ("stop", "length", "other", "missing"):
+        raise BackendError("invalid_broker_diagnostic")
+    if type(value["content_present"]) is not bool or type(value["thinking_present"]) is not bool:
+        raise BackendError("invalid_broker_diagnostic")
+    if type(value["response_bytes"]) is not int or not 0 <= value["response_bytes"] <= MAX_RESPONSE:
+        raise BackendError("invalid_broker_diagnostic")
+    return value
+
+
+def _failure_metadata(category, started, status=None, raw=b"", value=None):
+    msg = value.get("message") if type(value) is dict else None
+    msg = msg if type(msg) is dict else {}
+    done = value.get("done_reason") if type(value) is dict else None
+    reason = done if done in ("stop", "length") else "other" if type(done) is str else "missing"
+    diagnostic = {"schema": DIAGNOSTIC_SCHEMA, "category": category,
+        "elapsed_ms": min(120000, max(0, int((time.monotonic() - started) * 1000))),
+        "http_status": status, "done_reason": reason,
+        "content_present": type(msg.get("content")) is str and bool(msg["content"].strip()),
+        "thinking_present": type(msg.get("thinking")) is str and bool(msg["thinking"].strip()),
+        "response_bytes": len(raw)}
+    return _validate_diagnostic(diagnostic)
 
 
 def strict_json(raw):
@@ -76,12 +122,18 @@ def load_config(path):
     cfg = strict_json(p.read_text(encoding="utf-8-sig"))
     required = {"schema", "port", "model", "token_file", "timeout_seconds", "max_tokens",
                 "broker_state", "expires_at", "max_calls"}
-    if type(cfg) is not dict or set(cfg) != required or cfg["schema"] != SCHEMA:
+    optional = {"qwen35_08b_think_false"}
+    if type(cfg) is not dict or not required <= set(cfg) or set(cfg) - required - optional or cfg["schema"] != SCHEMA:
         raise ValueError("invalid backend config schema")
     if type(cfg["port"]) is not int or not 1024 <= cfg["port"] <= 65535 or cfg["port"] == 11434:
         raise ValueError("invalid broker port")
     if type(cfg["model"]) is not str or not 1 <= len(cfg["model"]) <= 100 or any(ord(c) < 33 for c in cfg["model"]):
         raise ValueError("invalid model name")
+    if "qwen35_08b_think_false" in cfg and (
+        type(cfg["qwen35_08b_think_false"]) is not bool or
+        (cfg["qwen35_08b_think_false"] and cfg["model"] != "qwen3.5:0.8b")
+    ):
+        raise ValueError("thinking override only allowed for qwen3.5:0.8b")
     _number(cfg["timeout_seconds"], 1, 60)
     if type(cfg["max_tokens"]) is not int or not 16 <= cfg["max_tokens"] <= 384:
         raise ValueError("invalid generation budget")
@@ -157,10 +209,15 @@ class AuthenticatedBackend:
             payload = strict_json(body)
             status, headers, raw = _post(self.port, "/v1/evaluate", body,
                 {"Content-Type": "application/json", "X-Initiative-MAC": _mac(self.key, b"REQUEST\n", body)}, self.timeout)
-            if status != 200:
-                raise BackendError("broker_http_" + str(status))
             signature = next((v for k, v in headers.items() if k.lower() == "x-initiative-mac"), "")
             expected = _mac(self.key, b"RESPONSE\n" + payload["nonce"].encode() + b"\n", raw)
+            if status == 502 and hmac.compare_digest(signature, expected):
+                failure = strict_json(raw)
+                if type(failure) is dict and set(failure) == {"error", "diagnostic"} and failure["error"] == "bounded_inference_rejected":
+                    diag = _validate_diagnostic(failure["diagnostic"])
+                    raise BackendError("ollama_failure category={category} http_status={http_status} elapsed_ms={elapsed_ms} done_reason={done_reason} content_present={content_present} thinking_present={thinking_present} response_bytes={response_bytes}".format(**diag))
+            if status != 200:
+                raise BackendError("broker_http_" + str(status))
             if not hmac.compare_digest(signature, expected):
                 raise BackendError("broker_response_authentication_failed")
             result = strict_json(raw)
@@ -183,21 +240,31 @@ def backend_from_config(path):
 
 
 def ollama_inference(messages, cfg):
-    body = canonical({"model": cfg["model"], "messages": messages, "stream": False,
+    request = {"model": cfg["model"], "messages": messages, "stream": False,
         "format": "json", "keep_alive": "2m", "options": {"num_predict": cfg["max_tokens"],
-        "num_ctx": 4096, "temperature": 0, "seed": 20261106}})
-    status, _, raw = _post(11434, "/api/chat", body, {"Content-Type": "application/json"}, cfg["timeout_seconds"])
+        "num_ctx": 4096, "temperature": 0, "seed": 20261106}}
+    if cfg.get("qwen35_08b_think_false") is True and cfg["model"] == "qwen3.5:0.8b":
+        request["think"] = False
+    body = canonical(request)
+    started = time.monotonic()
+    try:
+        status, _, raw = _post(11434, "/api/chat", body, {"Content-Type": "application/json"}, cfg["timeout_seconds"])
+    except BackendError as exc:
+        raise OllamaDiagnosticFailure(_failure_metadata("transport", started)) from exc
     if status != 200:
-        raise BackendError("local_model_http_" + str(status))
-    value = strict_json(raw)
+        raise OllamaDiagnosticFailure(_failure_metadata("http_status", started, status, raw))
+    try:
+        value = strict_json(raw)
+    except (ValueError, UnicodeError) as exc:
+        raise OllamaDiagnosticFailure(_failure_metadata("invalid_json", started, status, raw)) from exc
     if type(value) is not dict or type(value.get("message")) is not dict:
-        raise BackendError("invalid_local_model_envelope")
+        raise OllamaDiagnosticFailure(_failure_metadata("invalid_envelope", started, status, raw, value))
     msg = value.get("message", {})
     if value.get("model") != cfg["model"] or value.get("done") is not True or value.get("done_reason") != "stop" or msg.get("role") != "assistant" or msg.get("tool_calls"):
-        raise BackendError("local_model_not_completed_or_tools")
+        raise OllamaDiagnosticFailure(_failure_metadata("unfinished_or_tools", started, status, raw, value))
     text = msg.get("content")
     if type(text) is not str or not text.strip() or len(text.encode()) > 4096:
-        raise BackendError("invalid_local_model_text")
+        raise OllamaDiagnosticFailure(_failure_metadata("invalid_text", started, status, raw, value))
     return text
 
 
@@ -328,6 +395,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 return self._reply(200, {"schema": SCHEMA, "model": cfg["model"], "text": text, "done": True}, nonce)
             finally:
                 self.server.inference_lock.release()
+        except OllamaDiagnosticFailure as exc:
+            return self._reply(502, {"error": "bounded_inference_rejected", "diagnostic": exc.diagnostic}, nonce)
         except (OSError, ValueError, TypeError, KeyError, BackendError):
             return self._reply(502, {"error": "bounded_inference_rejected"})
 
