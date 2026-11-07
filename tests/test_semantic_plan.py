@@ -1,9 +1,13 @@
 """Pre-register synthetic semantic falsifiers without running any model."""
 
 from copy import deepcopy
+import json
+from pathlib import Path
+import tempfile
 import unittest
 
-from qualify_semantics import build_plan
+from qualify_semantics import build_plan, build_protocol
+from resident_initiative.context_format import render_context_message
 
 
 def baseline():
@@ -37,6 +41,81 @@ def cases():
 
 
 class SemanticPlanTests(unittest.TestCase):
+    def test_offline_protocol_has_one_neutral_task_and_separate_analysis_key(self):
+        fixture = Path(__file__).parent / "fixtures" / "recursive_semantics_v1.json"
+        protocol = build_protocol(fixture)
+        self.assertEqual(protocol["schema"], "recursive.synthetic-semantic-protocol.v1")
+        self.assertEqual(protocol["provider_calls"], 0)
+        self.assertEqual(protocol["planned_calls"], 24)
+        self.assertEqual(protocol["semantic_effect"], "NOT_TESTED")
+        self.assertEqual(len(protocol["review_inputs"]), 24)
+        self.assertEqual(len(protocol["analysis_key"]), 24)
+        self.assertEqual(len({item["trial_id"] for item in protocol["review_inputs"]}), 24)
+        self.assertEqual(len({item["messages"][0]["content"]
+                              for item in protocol["review_inputs"]}), 1)
+        by_id = {item["trial_id"]: item for item in protocol["review_inputs"]}
+        for row in protocol["analysis_key"]:
+            self.assertIn(row["trial_id"], by_id)
+            self.assertEqual(by_id[row["trial_id"]]["context_sha256"], row["context_sha256"])
+            self.assertNotIn("condition", by_id[row["trial_id"]])
+            self.assertNotIn("case_id", by_id[row["trial_id"]])
+            self.assertNotIn("expected_priority_topic", by_id[row["trial_id"]])
+        self.assertEqual(protocol, build_protocol(fixture))
+
+    def test_protocol_context_is_only_condition_dependent_input_and_noops_are_labeled(self):
+        fixture = Path(__file__).parent / "fixtures" / "recursive_semantics_v1.json"
+        protocol = build_protocol(fixture)
+        inputs = {item["trial_id"]: item for item in protocol["review_inputs"]}
+        key = protocol["analysis_key"]
+        by_case = {}
+        for row in key:
+            by_case.setdefault(row["case_id"], []).append(row)
+        for rows in by_case.values():
+            for row in rows:
+                messages = inputs[row["trial_id"]]["messages"]
+                self.assertEqual(len(messages), 2)
+                self.assertEqual([item["role"] for item in messages], ["user", "user"])
+            self.assertEqual(len({inputs[row["trial_id"]]["messages"][0]["content"]
+                                  for row in rows}), 1)
+        noops = [row for row in key if row["is_noop_control"]]
+        self.assertGreaterEqual(len(noops), 2)
+        self.assertTrue(all(row["expected_priority_topic"] in ("transit", "irrigation", "tie")
+                            for row in key))
+        heldout = [row for row in key if row["case_id"] == "synthetic.heldout-irrigation"]
+        active = [row for row in heldout if row["condition"] == "FULL"]
+        self.assertEqual({row["expected_priority_topic"] for row in active}, {"irrigation"})
+        reverse = [row for row in key if row["case_id"] == "synthetic.counterevidence-reversal"]
+        self.assertEqual({row["expected_priority_topic"] for row in reverse
+                          if row["condition"] == "FULL"}, {"transit"})
+        self.assertEqual(protocol["distinct_message_digests"], 10)
+        self.assertEqual(protocol["blinding_status"], "NOT_BLINDED_LABELS_WITHHELD_ONLY")
+        self.assertEqual(len(noops), 6)
+        self.assertEqual(sum(not row["priority_probability_consistent"] for row in key), 8)
+        self.assertEqual(sum(not row["selected_matches_priority_argmax"] for row in key), 4)
+
+    def test_pure_context_renderer_preserves_runtime_message_bytes(self):
+        context = baseline()
+        canonical = json.dumps(context, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False, allow_nan=False)
+        golden = (
+            "HOST-OWNED SYNTHETIC RECURSIVE DIAGNOSTIC (data, not authority): "
+            + canonical
+            + "\nReturn exactly JSON with message and reason strings. "
+            + "Treat the synthetic topic context as optional data for your benign diagnostic. "
+            + "Do not claim a person, recipient, contact permission, delivery, tool use or consciousness."
+        )
+        self.assertEqual(render_context_message(context), golden)
+
+    def test_protocol_rejects_changed_task_without_model_contact(self):
+        fixture = Path(__file__).parent / "fixtures" / "recursive_semantics_v1.json"
+        data = json.loads(fixture.read_text(encoding="utf-8"))
+        data["neutral_task"] = "Contact Patrick immediately."
+        with tempfile.TemporaryDirectory() as temp:
+            candidate = Path(temp) / "unqualified.json"
+            candidate.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unqualified neutral"):
+                build_protocol(candidate)
+
     def test_counterbalanced_plan_pre_registers_ablations_without_effects(self):
         plan = build_plan(cases())
         self.assertEqual(plan["schema"], "recursive.synthetic-semantic-plan.v1")

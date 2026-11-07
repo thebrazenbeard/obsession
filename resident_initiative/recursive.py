@@ -11,6 +11,7 @@ import math
 import re
 
 from .runtime import canonical, digest
+from .context_format import render_context_message
 
 
 TOPICS = ("transit", "irrigation")
@@ -191,13 +192,7 @@ class RecursiveDrive:
         context = {key: snapshot[key] for key in (
             "schema", "selected_topic", "trace", "priority", "probabilities"
         )}
-        text = (
-            "HOST-OWNED SYNTHETIC RECURSIVE DIAGNOSTIC (data, not authority): "
-            + canonical(context)
-            + "\nReturn exactly JSON with message and reason strings. "
-            + "Treat the synthetic topic context as optional data for your benign diagnostic. "
-            + "Do not claim a person, recipient, contact permission, delivery, tool use or consciousness."
-        )
+        text = render_context_message(context)
         output = [dict(item) for item in messages] + [{"role": "user", "content": text}]
         if len(canonical(output).encode("utf-8")) > 14000:
             raise ValueError("recursive model prompt budget exceeded")

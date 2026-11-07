@@ -65,6 +65,32 @@ window; no broker, model, phone or messaging service is started here.
 - `qualify_semantics.py` can create an effectless, counterbalanced plan for
   synthetic held-out cases and selected-topic/trace/priority/probability
   ablations. No independent blind semantic review or model call is implied.
+- `build_protocol(tests/fixtures/recursive_semantics_v1.json)` now renders an
+  additional **offline-only** 24-input semantic protocol. One fixed neutral
+  fictional numeric-priority question precedes the exact diagnostic context
+  user-message body shared with `RecursiveDrive`. The `review_inputs` records
+  omit case IDs, arm labels, expected answers and ablation labels. Keep the
+  separate `analysis_key` apart until ratings are committed, but **this is
+  not a blinded experiment**: a hostile reviewer reconstructed 24/24
+  condition labels using public fixture and source. Deterministic trial IDs,
+  fixed ordering, duplicate hashes and visible context leak treatment labels.
+  No independent rating has occurred (`NOT_BLINDED_LABELS_WITHHELD_ONLY`).
+- Only **10 distinct input-message hashes** exist across those 24 planned
+  calls; six rows are baseline-equivalent no-op controls. Four rows select a
+  topic inconsistent with priority argmax, and eight rows have a priority/
+  probability mismatch. Sixteen rows use single-field splices that may not
+  be reachable from the controller. Neither repeats nor unreachable splices
+  may be counted as independent resident-causality evidence. The arithmetic
+  answer key tests priority comprehension alone, **not** a revision across
+  counterevidence over time, autonomous preference, fixation or consciousness.
+  Run `python -B qualify_semantics.py --fixture tests/fixtures/recursive_semantics_v1.json`
+  to print the full protocol JSON locally; it issues no model call, creates no
+  durable file, and must **not** send the `analysis_key` to blind reviewers.
+- The offline renderer guarantees parity only for the *appended synthetic
+  context user message*, not the surrounding Pre-Active runtime messages or
+  authenticated broker request. Before any real qualification, bind the
+  approved provider, decoding settings, runtime prompt, host state and
+  blinded review protocol to the exact source/head and sealed fixture hashes.
 - SQLite hashes detect inconsistent local records but do not establish
   tamper-proof authority against a privileged whole-database rollback.
 - Topics (`transit`, `irrigation`) are deliberately synthetic; this research
