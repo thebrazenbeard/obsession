@@ -160,6 +160,22 @@ class EventChannelBridgeTests(unittest.TestCase):
             self.run_bridge([])
         self.assertEqual(1,len(self.run_bridge()['candidates']))
 
+    def test_nonempty_mismatched_catalog_does_not_poison_replay(self):
+        policy=AdmissionPolicy(expected_host='qualified-fixture-host',
+            expected_source='synthetic-fixture-collector',
+            declared_local_ports=frozenset({9147,9148}))
+        ledger=ReplayLedger(max_entries=8)
+        with self.assertRaises(ValueError):
+            candidate_routes_from_tattler_events([copy.deepcopy(EVENT)],
+                [DeclaredChannel('wrong_port',9148)],
+                policy=policy,ledger=ledger,now=NOW)
+        outcome=candidate_routes_from_tattler_events([copy.deepcopy(EVENT)],
+            [DeclaredChannel('target_port',9147),DeclaredChannel('other_port',9148)],
+            policy=policy,ledger=ledger,now=NOW)
+        self.assertEqual(1,len(outcome['candidates']))
+        self.assertEqual('target_port',outcome['candidates'][0]['channel_id'])
+        self.assertEqual(0,outcome['replay_count'])
+
     def test_crosswalk_event_replay_yields_no_second_candidate(self):
         self.run_bridge()
         second=self.run_bridge()

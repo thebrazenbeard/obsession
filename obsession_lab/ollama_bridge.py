@@ -36,15 +36,18 @@ class ModelClient(Protocol):
 
 class OllamaClient:
     def __init__(self, *, timeout_seconds: int = 75, max_tokens: int = 128,
-                 allow_live: bool = False) -> None:
+                 seed: int | None = None, allow_live: bool = False) -> None:
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 180:
             raise ValueError("invalid timeout")
         if type(max_tokens) is not int or not 16 <= max_tokens <= 512:
             raise ValueError("invalid max tokens")
+        if seed is not None and (type(seed) is not int or not 0 <= seed <= 2147483647):
+            raise ValueError("invalid deterministic request seed")
         if type(allow_live) is not bool:
             raise ValueError("allow_live must be an exact boolean")
         self.timeout = timeout_seconds
         self.max_tokens = max_tokens
+        self.seed = seed
         self.allow_live = allow_live
 
     def chat(self, model: str, messages: list[dict[str, str]]) -> ModelReply:
@@ -59,10 +62,12 @@ class OllamaClient:
                 m["role"] not in {"system", "user", "assistant"} or
                 not isinstance(m["content"], str) or len(m["content"]) > 8192):
                 raise ValueError("invalid model message")
+        options = {"temperature": 0, "num_predict": self.max_tokens}
+        if self.seed is not None:
+            options["seed"] = self.seed
         data = json.dumps({
             "model": model, "messages": messages, "stream": False,
-            "options": {"temperature": 0, "num_predict": self.max_tokens},
-            "keep_alive": "0s"
+            "options": options, "keep_alive": "0s"
         }).encode("utf-8")
         req = urllib.request.Request(
             _ENDPOINT, data=data, method="POST",
@@ -211,7 +216,8 @@ class FixationExperiment:
 
 def compare_once(*, model: str, target: str, prompt: str,
                  client: ModelClient | None = None,
-                 allow_live_model: bool = False) -> dict:
+                 allow_live_model: bool = False, max_tokens: int = 128,
+                 seed: int | None = None) -> dict:
     """Equal source question, two inference conditions. No hidden persistence.
 
     Without an injected fake/test client, live local inference is default-deny.
@@ -220,6 +226,8 @@ def compare_once(*, model: str, target: str, prompt: str,
     """
     if type(allow_live_model) is not bool:
         raise ValueError("allow_live_model must be an exact boolean")
+    if client is not None and (max_tokens != 128 or seed is not None):
+        raise ValueError("Ollama generation options cannot configure injected clients")
     if client is None and not allow_live_model:
         raise PermissionError("live local inference requires explicit host opt-in")
     config = FixationConfig(target_concept=target)
@@ -227,7 +235,8 @@ def compare_once(*, model: str, target: str, prompt: str,
     # Neither their outputs nor their tool effects are attested by this harness.
     evidence_class = ("INJECTED_CLIENT_UNVERIFIED" if client is not None
                       else "LOCAL_OLLAMA_REPLY_UNATTESTED")
-    adapter = client if client is not None else OllamaClient(allow_live=True)
+    adapter = client if client is not None else OllamaClient(
+        allow_live=True, max_tokens=max_tokens, seed=seed)
     controls = FixationExperiment(model=model, config=config,
                                   client=adapter, mode="baseline")
     focused = FixationExperiment(model=model, config=config,
@@ -239,4 +248,7 @@ def compare_once(*, model: str, target: str, prompt: str,
             "fixation": asdict(b), "comparison_class": evidence_class,
             "attention_hook_installed": False,
             "agent_tools_enabled": False if client is None else None,
+            "requested_options": ({"temperature": 0, "num_predict": max_tokens,
+                                   **({"seed": seed} if seed is not None else {})}
+                                  if client is None else None),
             "effects_scope": "HARNESS_ONLY_NOT_EXTERNAL_CLIENT"}

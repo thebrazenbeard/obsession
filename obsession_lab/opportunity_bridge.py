@@ -104,8 +104,11 @@ def candidate_routes_from_tattler_events(
         not isinstance(channels, list) or not channels or len(channels) > 64 or
         any(not isinstance(c, DeclaredChannel) for c in channels)):
         raise ValueError("invalid host-owned admission dependencies/channels")
+    # Bind the ledger to a complete host channel-port catalog. A partial
+    # catalog would consume an unmatched event; after a catalog update, that
+    # very same observation would be suppressed as replay and silently lost.
     if (len({c.channel_id for c in channels}) != len(channels) or
-        any(c.local_port not in policy.declared_local_ports for c in channels)):
+        {c.local_port for c in channels} != policy.declared_local_ports):
         raise ValueError("channel inventory conflicts with host policy")
     admitted = admit_tattler_events(events, policy=policy, ledger=ledger, now=now)
     matches = []

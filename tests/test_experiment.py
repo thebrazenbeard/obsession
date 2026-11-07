@@ -249,6 +249,39 @@ class ModelBridgeTests(unittest.TestCase):
             with self.assertRaises(ValueError):OllamaClient(max_tokens=n)
         with self.assertRaises(ValueError):OllamaClient(timeout_seconds=0)
 
+    def test_bounded_seeded_local_ollama_request_options(self):
+        expected={'model':'qwen2.5-coder:1.5b-instruct-q8_0',
+                  'done':True,'done_reason':'stop',
+                  'message':{'role':'assistant','content':'Synthetic complete answer'}}
+        requests=[]
+        def local_reply(request,*,timeout):
+            requests.append(json.loads(request.data.decode('utf-8')))
+            return io.BytesIO(json.dumps(expected).encode('utf-8'))
+        with patch('obsession_lab.ollama_bridge.open_fixed_loopback',side_effect=local_reply):
+            result=compare_once(model=expected['model'],target='railway scheduling',
+                prompt='What moves the tides?',allow_live_model=True,
+                max_tokens=384,seed=20261106)
+        self.assertEqual(2,len(requests))
+        for payload in requests:
+            self.assertEqual({'temperature':0,'num_predict':384,'seed':20261106},
+                             payload['options'])
+        self.assertEqual({'temperature':0,'num_predict':384,'seed':20261106},
+                         result['requested_options'])
+        self.assertEqual('LOCAL_OLLAMA_REPLY_UNATTESTED',result['comparison_class'])
+        self.assertFalse(result['attention_hook_installed'])
+
+    def test_opt_in_model_options_are_rejected_for_injected_clients(self):
+        with self.assertRaises(ValueError):
+            compare_once(model='qwen3:4b-instruct',target='synthetic',
+                prompt='Synthetic prompt',client=self.client,max_tokens=384)
+        with self.assertRaises(ValueError):
+            compare_once(model='qwen3:4b-instruct',target='synthetic',
+                prompt='Synthetic prompt',client=self.client,seed=1)
+        self.assertEqual([],self.client.calls)
+        for invalid in (-1,True,2147483648,'123'):
+            with self.subTest(seed=invalid),self.assertRaises(ValueError):
+                OllamaClient(seed=invalid)
+
     def test_ollama_reply_identity_completion_and_tools_are_validated(self):
         requested="qwen3:4b-instruct"
         good={"model":requested,"done":True,
