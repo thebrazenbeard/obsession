@@ -39,20 +39,32 @@ candidate; idle/partial clients are intended to time out in 3 seconds.
 - Allowed payload is the current resident gate `_handoff_payload` UTF-8 bytes:
 
 ```json
-{"schema":"initiative.local-handoff.v1","scope":"LOCAL_SYNTHETIC_HANDOFF_ONLY","proposal_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","proposal":{"label":"synthetic"},"delivery_verified":false,"contact_authorized":false}
+{"schema":"initiative.local-handoff.v1","scope":"LOCAL_SYNTHETIC_HANDOFF_ONLY","proposal_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","proposal":{"schema":"initiative.proposal.v1","proposal_id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","generation":"a-valid-generation"},"delivery_verified":false,"contact_authorized":false}
 ```
 
   Actual bytes include a trailing `\n`. Canonical resident serialization is
   `json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
-  + '\n'`. Native code currently validates top-level fields, not full nested
-  proposal schema or canonical ordering. The protected grant SHA-256, however,
-  is over **exact bytes including newline**. The canonical schema is a
-  source-only compatibility assumption until tested against real resident output.
+  + '\n'`. The sample above abbreviates the nested object and is **not a
+  complete qualifying payload**. The patched native source requires all 22
+  nested proposal keys and essential synthetic-only flags, origin, category,
+  generation and artifact-ID bindings. It does not independently recompute the
+  proposal hash from canonical JSON. The protected owner grant SHA-256, however,
+  covers the **exact full output bytes including newline**. Windows integration
+  with the real resident is still unverified.
+- `proposal_digest`, nested `proposal_id`, `idempotency_key` and `goal_digest`
+  are typed `sha256:<64 lowercase hex>`. The `artifact_id` and protected
+  GRANT SHA-256 remain unprefixed raw 64-character lowercase hex.
 - `artifact_id` is resident `proposal_id` with leading `sha256:` removed.
   Grant digest (`sha256`) is SHA-256 of the entire handoff payload and may be
   *different from* resident `proposal_digest`.
 - Any non-success response (including `HOLD|...`) is a **hard refusal**. No
   local-file/SQLite fallback and no direct write to custodian output permitted.
+- Before .NET `JavaScriptSerializer` materializes objects, the native service
+  scans the full JSON input to reject repeated property names at every object
+  depth and rejects escaped object keys. This matters because the framework
+  deserializer was observed collapsing duplicate keys. Staging tests denied
+  duplicate top-level, duplicate nested, and escaped-key synthetic handoffs;
+  a real protected Windows pipe test remains outstanding.
 
 ## Persistent files (protected-install target only)
 

@@ -4,6 +4,8 @@
 // Protected host output is LOCAL_SYNTHETIC_HANDOFF_ONLY, never a recipient send.
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Security.AccessControl;
@@ -32,6 +34,20 @@ namespace Vera.ObsessionStop
         private static readonly Regex Generation = new Regex(@"\A[a-zA-Z0-9_-]{8,96}\z", RegexOptions.Compiled);
         private static readonly Regex ArtifactId = new Regex(@"\A[a-f0-9]{64}\z", RegexOptions.Compiled);
         private static readonly Regex Digest = new Regex(@"\A[a-f0-9]{64}\z", RegexOptions.Compiled);
+        // Resident proposal IDs/digests are typed; the protected artifact
+        // hash and artifact filename remain raw 64-character lowercase hex.
+        private static readonly Regex TypedDigest = new Regex(@"\Asha256:[a-f0-9]{64}\z", RegexOptions.Compiled);
+        private static readonly string[] HandoffKeys = {
+            "schema", "scope", "proposal_digest", "proposal",
+            "delivery_verified", "contact_authorized"
+        };
+        private static readonly string[] ProposalKeys = {
+            "schema", "proposal_id", "idempotency_key", "event_id", "generation",
+            "goal_digest", "created_at", "expires_at", "target_class", "message",
+            "reason", "salience", "execution_authorized", "contact_authorized",
+            "delivery_verified", "provider_evidence", "provenance", "origin",
+            "category", "propose_only", "ttl_seconds", "evidence_class"
+        };
         private readonly object gate = new object();
         private readonly HashSet<string> revoked = new HashSet<string>(StringComparer.Ordinal);
         private readonly Dictionary<string, Grant> grants = new Dictionary<string, Grant>(StringComparer.Ordinal);
@@ -76,7 +92,17 @@ namespace Vera.ObsessionStop
                 FileAttributes a = File.GetAttributes(p);
                 if ((a & FileAttributes.ReparsePoint) != 0)
                     throw new IOException("reparse-point root denied");
-                RejectBroadAcl(Directory.GetAccessControl(p, AccessControlSections.Access));
+                // Windows can grant Authenticated Users CreateDirectories /
+                // AppendData on an ancestor without granting replacement of
+                // an existing protected child. Deny structural rights on all
+                // ancestors; require strictly no broad writes on custody roots.
+                bool strict = String.Equals(p, Root, StringComparison.OrdinalIgnoreCase)
+                    || String.Equals(p, PathInside("output"), StringComparison.OrdinalIgnoreCase);
+                DirectorySecurity acl = Directory.GetAccessControl(p,
+                    AccessControlSections.Access | AccessControlSections.Owner);
+                RejectBroadAcl(acl, strict);
+                if (String.Equals(p, Path.GetDirectoryName(Root), StringComparison.OrdinalIgnoreCase)
+                    || strict) RequireTrustedOwner(acl);
             }
             string executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
             if (!string.Equals(Path.GetFullPath(executable), PathInside("ObsessionStopCustodian.exe"),
@@ -84,7 +110,10 @@ namespace Vera.ObsessionStop
                 throw new IOException("executable outside protected service root");
             if ((File.GetAttributes(executable) & FileAttributes.ReparsePoint) != 0)
                 throw new IOException("executable reparse point denied");
-            RejectBroadAcl(File.GetAccessControl(executable, AccessControlSections.Access));
+            FileSecurity exeAcl = File.GetAccessControl(executable,
+                AccessControlSections.Access | AccessControlSections.Owner);
+            RejectBroadAcl(exeAcl, true);
+            RequireTrustedOwner(exeAcl);
             string pinnedHash = File.ReadAllText(PathInside("binary.sha256"), Encoding.ASCII).Trim();
             if (!Digest.IsMatch(pinnedHash) || Sha256Hex(File.ReadAllBytes(executable)) != pinnedHash)
                 throw new IOException("protected executable hash mismatch");
@@ -106,7 +135,16 @@ namespace Vera.ObsessionStop
 #endif
         }
 
-        private static void RejectBroadAcl(FileSystemSecurity security)
+        private static void RequireTrustedOwner(FileSystemSecurity security)
+        {
+            SecurityIdentifier sid = security.GetOwner(typeof(SecurityIdentifier))
+                as SecurityIdentifier;
+            if (sid == null || !(sid.IsWellKnown(WellKnownSidType.LocalSystemSid)
+                || sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid)))
+                throw new IOException("custody path owner is not SYSTEM or Administrators");
+        }
+
+        private static void RejectBroadAcl(FileSystemSecurity security, bool strict)
         {
             AuthorizationRuleCollection rules = security.GetAccessRules(true, true,
                                                                        typeof(SecurityIdentifier));
@@ -120,10 +158,12 @@ namespace Vera.ObsessionStop
                 bool broad = sid.IsWellKnown(WellKnownSidType.WorldSid)
                     || sid.IsWellKnown(WellKnownSidType.AuthenticatedUserSid)
                     || sid.IsWellKnown(WellKnownSidType.BuiltinUsersSid);
-                FileSystemRights dangerous =
-                    FileSystemRights.Write | FileSystemRights.Modify
+                FileSystemRights dangerous = FileSystemRights.WriteData
                     | FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles
                     | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
+                if (strict)
+                    dangerous |= FileSystemRights.AppendData | FileSystemRights.WriteAttributes
+                        | FileSystemRights.WriteExtendedAttributes;
                 if (broad && (access.FileSystemRights & dangerous) != 0)
                     throw new IOException("broad host ACL write/delete authority denied");
             }
@@ -155,7 +195,10 @@ namespace Vera.ObsessionStop
                 {
                     if ((File.GetAttributes(p) & FileAttributes.ReparsePoint) != 0)
                         throw new IOException("protected file reparse point denied");
-                    RejectBroadAcl(File.GetAccessControl(p, AccessControlSections.Access));
+                    FileSecurity acl = File.GetAccessControl(p,
+                        AccessControlSections.Access | AccessControlSections.Owner);
+                    RejectBroadAcl(acl, true);
+                    RequireTrustedOwner(acl);
                 }
 #endif
                 foreach (string row in File.ReadAllLines(stopPath, Encoding.ASCII))
@@ -282,7 +325,7 @@ namespace Vera.ObsessionStop
             catch (FormatException) { return "HOLD|INVALID_BASE64"; }
             if (payload.Length < 1 || payload.Length > 4096)
                 return "HOLD|PAYLOAD_BOUND";
-            if (!IsSyntheticHandoff(payload)) return "HOLD|NOT_SYNTHETIC_HANDOFF";
+            if (!IsSyntheticHandoff(payload, p[1], p[2])) return "HOLD|NOT_SYNTHETIC_HANDOFF";
             string hash = Sha256Hex(payload);
             lock (gate)
             {
@@ -319,7 +362,183 @@ namespace Vera.ObsessionStop
             }
         }
 
-        private static bool IsSyntheticHandoff(byte[] payload)
+        private static bool HasExactKeys(Dictionary<string, object> fields, string[] required)
+        {
+            if (fields == null || fields.Count != required.Length) return false;
+            foreach (string key in required)
+                if (!fields.ContainsKey(key)) return false;
+            return true;
+        }
+
+        // JavaScriptSerializer materializes objects as dictionaries, potentially
+        // losing duplicate properties before application validation. Walk the
+        // JSON tokens first and reject duplicate keys in EVERY object, including
+        // nested proposal/salience/provenance objects. Canonical resident keys
+        // are unescaped; reject escaped object keys so two spellings cannot
+        // collapse into one semantic key after parser normalization.
+        private sealed class UniqueJsonScanner
+        {
+            private readonly string source;
+            private int position;
+
+            private UniqueJsonScanner(string json) { source = json; }
+
+            public static bool Valid(string json)
+            {
+                try
+                {
+                    UniqueJsonScanner parser = new UniqueJsonScanner(json);
+                    parser.Value(0);
+                    parser.Space();
+                    return parser.position == json.Length;
+                }
+                catch (FormatException) { return false; }
+            }
+
+            private void Space()
+            {
+                while (position < source.Length && (source[position] == ' '
+                    || source[position] == '\t' || source[position] == '\r'
+                    || source[position] == '\n')) position++;
+            }
+
+            private bool Take(char expected)
+            {
+                if (position >= source.Length || source[position] != expected) return false;
+                position++;
+                return true;
+            }
+
+            private void Need(char expected)
+            {
+                if (!Take(expected)) throw new FormatException("invalid JSON delimiter");
+            }
+
+            private static bool Digit(char c) { return c >= '0' && c <= '9'; }
+            private static bool Hex(char c)
+            {
+                return Digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            }
+
+            private string Quoted(bool key)
+            {
+                Need('"');
+                int start = position;
+                while (position < source.Length)
+                {
+                    char c = source[position++];
+                    if (c == '"') return source.Substring(start, position - start - 1);
+                    if (c < 32) throw new FormatException("unescaped control character");
+                    if (c != '\\') continue;
+                    if (key || position >= source.Length)
+                        throw new FormatException("escaped JSON key denied");
+                    char escape = source[position++];
+                    if (escape == 'u')
+                    {
+                        for (int i = 0; i < 4; i++)
+                            if (position >= source.Length || !Hex(source[position++]))
+                                throw new FormatException("invalid unicode escape");
+                    }
+                    else if (escape != '"' && escape != '\\' && escape != '/'
+                        && escape != 'b' && escape != 'f' && escape != 'n'
+                        && escape != 'r' && escape != 't')
+                        throw new FormatException("invalid JSON escape");
+                }
+                throw new FormatException("unterminated JSON string");
+            }
+
+            private void Literal(string word)
+            {
+                if (source.Length - position < word.Length
+                    || String.CompareOrdinal(source, position, word, 0, word.Length) != 0)
+                    throw new FormatException("invalid JSON literal");
+                position += word.Length;
+            }
+
+            private void Number()
+            {
+                Take('-');
+                if (!Take('0'))
+                {
+                    if (position >= source.Length || source[position] < '1'
+                        || source[position] > '9') throw new FormatException("invalid JSON number");
+                    while (position < source.Length && Digit(source[position])) position++;
+                }
+                if (Take('.'))
+                {
+                    if (position >= source.Length || !Digit(source[position]))
+                        throw new FormatException("invalid JSON decimal");
+                    while (position < source.Length && Digit(source[position])) position++;
+                }
+                if (Take('e') || Take('E'))
+                {
+                    if (!Take('+')) Take('-');
+                    if (position >= source.Length || !Digit(source[position]))
+                        throw new FormatException("invalid JSON exponent");
+                    while (position < source.Length && Digit(source[position])) position++;
+                }
+            }
+
+            private void Value(int depth)
+            {
+                if (depth > 32) throw new FormatException("JSON nesting bound exceeded");
+                Space();
+                if (position >= source.Length) throw new FormatException("missing JSON value");
+                char c = source[position];
+                if (c == '{')
+                {
+                    position++;
+                    HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+                    Space();
+                    if (Take('}')) return;
+                    do
+                    {
+                        Space();
+                        string key = Quoted(true);
+                        if (!seen.Add(key)) throw new FormatException("duplicate JSON key");
+                        Space(); Need(':');
+                        Value(depth + 1);
+                        Space();
+                        if (Take('}')) return;
+                        Need(',');
+                    } while (true);
+                }
+                if (c == '[')
+                {
+                    position++;
+                    Space();
+                    if (Take(']')) return;
+                    do
+                    {
+                        Value(depth + 1);
+                        Space();
+                        if (Take(']')) return;
+                        Need(',');
+                    } while (true);
+                }
+                if (c == '"') { Quoted(false); return; }
+                if (c == 't') { Literal("true"); return; }
+                if (c == 'f') { Literal("false"); return; }
+                if (c == 'n') { Literal("null"); return; }
+                Number();
+            }
+        }
+
+        private static bool IsFalse(Dictionary<string, object> fields, string key)
+        {
+            object value;
+            return fields.TryGetValue(key, out value) && value is bool && !(bool)value;
+        }
+
+        private static bool IsFiniteNumber(object value, double min, double max)
+        {
+            if (!(value is int || value is long || value is double || value is decimal))
+                return false;
+            double n = Convert.ToDouble(value, CultureInfo.InvariantCulture);
+            return !double.IsNaN(n) && !double.IsInfinity(n) && n > min && n <= max;
+        }
+
+        private static bool IsSyntheticHandoff(byte[] payload, string generation, string artifactId)
         {
             try
             {
@@ -327,50 +546,110 @@ namespace Vera.ObsessionStop
                 if (json.IndexOf('\0') >= 0 || json.IndexOf('\r') >= 0
                     || !json.EndsWith("\n", StringComparison.Ordinal)
                     || json.EndsWith("\n\n", StringComparison.Ordinal)) return false;
+                if (!UniqueJsonScanner.Valid(json)) return false;
                 JavaScriptSerializer serializer = new JavaScriptSerializer();
                 serializer.MaxJsonLength = 4096;
                 Dictionary<string, object> fields = serializer.DeserializeObject(json)
                     as Dictionary<string, object>;
-                if (fields == null || fields.Count != 6) return false;
-                object schema, scope, delivery, contact, digest, proposal;
-                return fields.Count == 6
-                    && fields.TryGetValue("schema", out schema)
-                    && (schema as string) == "initiative.local-handoff.v1"
-                    && fields.TryGetValue("scope", out scope)
-                    && (scope as string) == "LOCAL_SYNTHETIC_HANDOFF_ONLY"
-                    && fields.TryGetValue("delivery_verified", out delivery)
-                    && delivery is bool && !(bool)delivery
-                    && fields.TryGetValue("contact_authorized", out contact)
-                    && contact is bool && !(bool)contact
-                    && fields.TryGetValue("proposal_digest", out digest)
-                    && digest is string && Digest.IsMatch((string)digest)
-                    && fields.TryGetValue("proposal", out proposal)
-                    && proposal is Dictionary<string, object>;
+                if (!HasExactKeys(fields, HandoffKeys)) return false;
+                object schema, scope, digest, proposal;
+                if (!fields.TryGetValue("schema", out schema)
+                    || (schema as string) != "initiative.local-handoff.v1"
+                    || !fields.TryGetValue("scope", out scope)
+                    || (scope as string) != "LOCAL_SYNTHETIC_HANDOFF_ONLY"
+                    || !IsFalse(fields, "delivery_verified")
+                    || !IsFalse(fields, "contact_authorized")
+                    || !fields.TryGetValue("proposal_digest", out digest)
+                    || !(digest is string) || !TypedDigest.IsMatch((string)digest)
+                    || !fields.TryGetValue("proposal", out proposal)) return false;
+
+                Dictionary<string, object> child = proposal as Dictionary<string, object>;
+                if (!HasExactKeys(child, ProposalKeys)) return false;
+                string typedArtifact = "sha256:" + artifactId;
+                object proposalId, idempotencyKey, childGeneration, childGoalDigest;
+                object origin, category, targetClass, modelSchema, proposeOnly;
+                object evidence, provider, createdAt, expiresAt, ttl, message, reason;
+                object salience, provenance;
+                return child.TryGetValue("schema", out modelSchema)
+                    && (modelSchema as string) == "initiative.proposal.v1"
+                    && child.TryGetValue("proposal_id", out proposalId)
+                    && (proposalId as string) == typedArtifact
+                    && child.TryGetValue("idempotency_key", out idempotencyKey)
+                    && (idempotencyKey as string) == typedArtifact
+                    && child.TryGetValue("generation", out childGeneration)
+                    && (childGeneration as string) == generation
+                    && child.TryGetValue("goal_digest", out childGoalDigest)
+                    && childGoalDigest is string && TypedDigest.IsMatch((string)childGoalDigest)
+                    && child.TryGetValue("origin", out origin)
+                    && (origin as string) == "OBSESSION_RESIDENT_SYNTHETIC_V1"
+                    && child.TryGetValue("category", out category)
+                    && (category as string) == "OWNER_DIRECTED_SYNTHETIC_DIAGNOSTIC"
+                    && child.TryGetValue("target_class", out targetClass)
+                    && (targetClass as string) == "SYNTHETIC_LOCAL_ONLY"
+                    && child.TryGetValue("propose_only", out proposeOnly)
+                    && proposeOnly is bool && (bool)proposeOnly
+                    && IsFalse(child, "execution_authorized")
+                    && IsFalse(child, "contact_authorized")
+                    && IsFalse(child, "delivery_verified")
+                    && child.TryGetValue("provider_evidence", out provider)
+                    && provider is string
+                    && child.TryGetValue("evidence_class", out evidence)
+                    && (evidence as string) == (provider as string)
+                    && child.TryGetValue("created_at", out createdAt)
+                    && IsFiniteNumber(createdAt, -1.0, double.MaxValue)
+                    && child.TryGetValue("expires_at", out expiresAt)
+                    && IsFiniteNumber(expiresAt, 0.0, double.MaxValue)
+                    && child.TryGetValue("ttl_seconds", out ttl)
+                    && IsFiniteNumber(ttl, 0.0, 86400.0)
+                    && child.TryGetValue("message", out message)
+                    && message is string && ((string)message).Length <= 512
+                    && !String.IsNullOrWhiteSpace((string)message)
+                    && child.TryGetValue("reason", out reason)
+                    && reason is string && ((string)reason).Length <= 256
+                    && !String.IsNullOrWhiteSpace((string)reason)
+                    && child.TryGetValue("salience", out salience)
+                    && salience is Dictionary<string, object>
+                    && child.TryGetValue("provenance", out provenance)
+                    && provenance is Dictionary<string, object>;
             }
             catch (Exception) { return false; }
         }
 
         private static byte[] ReadFrame(Stream stream)
         {
+            // One monotonic deadline for the COMPLETE frame, including the
+            // length header and payload. A per-read timeout permits an
+            // attacker to drip one byte every 2.9 seconds indefinitely.
+            long deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * 3;
             byte[] len = new byte[4];
-            ReadExact(stream, len, 0, 4);
+            ReadExact(stream, len, 0, 4, deadline);
             int n = (len[0] << 24) | (len[1] << 16) | (len[2] << 8) | len[3];
             if (n < 1 || n > 8192) throw new IOException("frame too large or empty");
             byte[] b = new byte[n];
-            ReadExact(stream, b, 0, n);
+            ReadExact(stream, b, 0, n, deadline);
             return b;
         }
 
-        private static void ReadExact(Stream s, byte[] b, int offset, int count)
+        private static int RemainingMilliseconds(long deadline)
+        {
+            long remaining = deadline - Stopwatch.GetTimestamp();
+            if (remaining <= 0) throw new IOException("whole-frame pipe deadline");
+            return (int)Math.Min(3000L, Math.Max(1L,
+                remaining * 1000L / Stopwatch.Frequency));
+        }
+
+        private static void ReadExact(Stream s, byte[] b, int offset, int count,
+                                      long deadline)
         {
             while (count > 0)
             {
+                int timeout = RemainingMilliseconds(deadline);
                 IAsyncResult pending = s.BeginRead(b, offset, count, null, null);
                 int got;
                 using (WaitHandle completed = pending.AsyncWaitHandle)
                 {
-                    if (!completed.WaitOne(3000))
-                        throw new IOException("pipe read deadline");
+                    if (!completed.WaitOne(timeout))
+                        throw new IOException("whole-frame pipe deadline");
                     got = s.EndRead(pending);
                 }
                 if (got <= 0) throw new EndOfStreamException();
@@ -381,21 +660,24 @@ namespace Vera.ObsessionStop
 
         private static void WriteFrame(Stream s, string message)
         {
+            long deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * 3;
             byte[] b = new UTF8Encoding(false, true).GetBytes(message);
             if (b.Length > 8192) throw new IOException("response too long");
             byte[] n = new byte[] { (byte)(b.Length >> 24), (byte)(b.Length >> 16),
                                      (byte)(b.Length >> 8), (byte)b.Length };
-            WriteWithDeadline(s, n);
-            WriteWithDeadline(s, b);
+            WriteWithDeadline(s, n, deadline);
+            WriteWithDeadline(s, b, deadline);
             s.Flush();
         }
 
-        private static void WriteWithDeadline(Stream stream, byte[] buffer)
+        private static void WriteWithDeadline(Stream stream, byte[] buffer,
+                                              long deadline)
         {
+            int timeout = RemainingMilliseconds(deadline);
             IAsyncResult pending = stream.BeginWrite(buffer, 0, buffer.Length, null, null);
             using (WaitHandle completed = pending.AsyncWaitHandle)
             {
-                if (!completed.WaitOne(3000)) throw new IOException("pipe write deadline");
+                if (!completed.WaitOne(timeout)) throw new IOException("whole-frame pipe deadline");
                 stream.EndWrite(pending);
             }
         }
@@ -484,9 +766,22 @@ namespace Vera.ObsessionStop
             initial.LoadState();
             string generation = "staging_generation_0001";
             string artifact = new string('a', 64);
+            string typedArtifact = "sha256:" + artifact;
             string payloadText = "{\"schema\":\"initiative.local-handoff.v1\",\"scope\":\"LOCAL_SYNTHETIC_HANDOFF_ONLY\","
-                + "\"proposal_digest\":\"" + new string('b', 64)
-                + "\",\"proposal\":{\"label\":\"staging-only\"},"
+                + "\"proposal_digest\":\"sha256:" + new string('b', 64)
+                + "\",\"proposal\":{\"schema\":\"initiative.proposal.v1\","
+                + "\"proposal_id\":\"" + typedArtifact + "\","
+                + "\"idempotency_key\":\"" + typedArtifact + "\","
+                + "\"event_id\":\"test.event\",\"generation\":\"" + generation + "\","
+                + "\"goal_digest\":\"sha256:" + new string('c', 64) + "\","
+                + "\"created_at\":100,\"expires_at\":200,\"ttl_seconds\":100,"
+                + "\"target_class\":\"SYNTHETIC_LOCAL_ONLY\",\"message\":\"fixture\","
+                + "\"reason\":\"bounded test\",\"salience\":{},"
+                + "\"execution_authorized\":false,\"contact_authorized\":false,"
+                + "\"delivery_verified\":false,\"provider_evidence\":\"INJECTED_PROVIDER_UNVERIFIED\","
+                + "\"evidence_class\":\"INJECTED_PROVIDER_UNVERIFIED\",\"provenance\":{},"
+                + "\"origin\":\"OBSESSION_RESIDENT_SYNTHETIC_V1\","
+                + "\"category\":\"OWNER_DIRECTED_SYNTHETIC_DIAGNOSTIC\",\"propose_only\":true},"
                 + "\"delivery_verified\":false,\"contact_authorized\":false}\n";
             byte[] payload = Encoding.UTF8.GetBytes(payloadText);
             string digest = Sha256Hex(payload);
@@ -495,6 +790,44 @@ namespace Vera.ObsessionStop
             string grant = "GRANT|" + generation + "|" + artifact + "|" + digest
                 + "|" + DateTime.UtcNow.AddMinutes(2).Ticks + "|V1";
             string grantResult = initial.OperatorCommand(grant);
+            string wrongTypedDigest = payloadText.Replace("\"proposal_digest\":\"sha256:",
+                                                         "\"proposal_digest\":\"");
+            string malformed = "PUBLISH|" + generation + "|" + artifact + "|"
+                + Convert.ToBase64String(Encoding.UTF8.GetBytes(wrongTypedDigest)) + "|V1";
+            string wrongNestedFlag = payloadText.Replace("\"execution_authorized\":false",
+                                                         "\"execution_authorized\":true");
+            string unsafeEnvelope = "PUBLISH|" + generation + "|" + artifact + "|"
+                + Convert.ToBase64String(Encoding.UTF8.GetBytes(wrongNestedFlag)) + "|V1";
+            string duplicateTop = payloadText.Replace(
+                "\"delivery_verified\":false,\"contact_authorized\":false}\n",
+                "\"delivery_verified\":false,\"contact_authorized\":false,\"contact_authorized\":false}\n");
+            string duplicateNested = payloadText.Replace(
+                "\"execution_authorized\":false",
+                "\"execution_authorized\":false,\"execution_authorized\":false");
+            string escapedNestedKey = payloadText.Replace(
+                "\"execution_authorized\":false",
+                "\"ex\\u0065cution_authorized\":false");
+            string deniedRawDigest = initial.PublishCommand(malformed);
+            string deniedUnsafeNested = initial.PublishCommand(unsafeEnvelope);
+            string deniedDuplicateTop = initial.PublishCommand("PUBLISH|" + generation + "|" + artifact
+                + "|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(duplicateTop)) + "|V1");
+            string deniedDuplicateNested = initial.PublishCommand("PUBLISH|" + generation + "|" + artifact
+                + "|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(duplicateNested)) + "|V1");
+            string deniedEscapedNestedKey = initial.PublishCommand("PUBLISH|" + generation + "|" + artifact
+                + "|" + Convert.ToBase64String(Encoding.UTF8.GetBytes(escapedNestedKey)) + "|V1");
+            // Diagnostic of the actual .NET framework parser behavior: the
+            // security result does not depend on whether it collapses or
+            // throws on duplicate names, because the scanner runs first.
+            string frameworkDuplicateBehavior;
+            try
+            {
+                Dictionary<string, object> parsed = new JavaScriptSerializer()
+                    .DeserializeObject("{\"flag\":false,\"flag\":true}")
+                    as Dictionary<string, object>;
+                frameworkDuplicateBehavior = parsed != null && parsed.Count == 1
+                    ? "COLLAPSED_TO_" + parsed["flag"] : "OTHER";
+            }
+            catch (Exception) { frameworkDuplicateBehavior = "THREW"; }
             string first = initial.PublishCommand(envelope);
             string stopped = initial.OperatorCommand("STOP|" + generation + "|V1");
             string afterStop = initial.PublishCommand(envelope);
@@ -503,11 +836,20 @@ namespace Vera.ObsessionStop
             string afterRestart = restarted.PublishCommand(envelope);
             Console.WriteLine("TEST_ONLY grant=" + grantResult + " first=" + first
                 + " stopped=" + stopped + " afterStop=" + afterStop
-                + " afterRestart=" + afterRestart);
+                + " afterRestart=" + afterRestart
+                + " rawDigest=" + deniedRawDigest + " unsafeNested=" + deniedUnsafeNested
+                + " dupTop=" + deniedDuplicateTop + " dupNested=" + deniedDuplicateNested
+                + " escapedKey=" + deniedEscapedNestedKey
+                + " frameworkDuplicate=" + frameworkDuplicateBehavior);
             if (!grantResult.StartsWith("GRANTED|") || !first.StartsWith("PUBLISHED|")
                 || !stopped.StartsWith("STOPPED|")
                 || afterStop != "HOLD|STOP_ACTIVE_OR_UNVERIFIED"
-                || afterRestart != "HOLD|STOP_ACTIVE_OR_UNVERIFIED")
+                || afterRestart != "HOLD|STOP_ACTIVE_OR_UNVERIFIED"
+                || deniedRawDigest != "HOLD|NOT_SYNTHETIC_HANDOFF"
+                || deniedUnsafeNested != "HOLD|NOT_SYNTHETIC_HANDOFF"
+                || deniedDuplicateTop != "HOLD|NOT_SYNTHETIC_HANDOFF"
+                || deniedDuplicateNested != "HOLD|NOT_SYNTHETIC_HANDOFF"
+                || deniedEscapedNestedKey != "HOLD|NOT_SYNTHETIC_HANDOFF")
                 Environment.ExitCode = 1;
 #else
             ServiceBase.Run(new StopCustodian());

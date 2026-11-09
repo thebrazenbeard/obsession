@@ -1,9 +1,11 @@
 """Pure source/wire tests; not a Windows ACL or service qualification."""
 
 import base64
+import ast
 import hashlib
 import json
 import unittest
+from pathlib import Path
 
 from resident_initiative.native_stop_pipe_client import (
     NativeNamedPipeChannel, NativeStopDenied, NativeStopPublishClient,
@@ -19,7 +21,7 @@ def payload():
     return (json.dumps({
         "schema": "initiative.local-handoff.v1",
         "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY",
-        "proposal_digest": "b" * 64,
+        "proposal_digest": "sha256:" + "b" * 64,
         "proposal": {"schema": "initiative.proposal.v1",
                      "target_class": "SYNTHETIC_LOCAL_ONLY",
                      "execution_authorized": False,
@@ -127,6 +129,31 @@ class NativePipeTests(unittest.TestCase):
         self.assertEqual(frame(raw), len(expected).to_bytes(4, "big") + expected)
         self.assertEqual(len(frame(raw)), len(raw) + 4)
 
+    def test_actual_gate_handoff_payload_uses_typed_proposal_digest(self):
+        # Load the exact production method AST without importing unrelated
+        # resident dependencies. This catches schema drift against gate.py.
+        gate_path = Path(__file__).resolve().parents[1] / "resident_initiative" / "gate.py"
+        tree = ast.parse(gate_path.read_text(encoding="utf-8"))
+        original = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "LocalHandoffGate")
+        method = next(n for n in original.body if isinstance(n, ast.FunctionDef) and n.name == "_handoff_payload")
+        fixture = ast.ClassDef(name="FixtureGate", bases=[], keywords=[], body=[method], decorator_list=[])
+        module = ast.fix_missing_locations(ast.Module(body=[fixture], type_ignores=[]))
+        globals_ = {"canonical": lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)}
+        exec(compile(module, str(gate_path), "exec"), globals_)
+        payload_from_gate = globals_["FixtureGate"]._handoff_payload(
+            {"proposal_digest": "sha256:" + "b" * 64}, json.loads(self.payload)["proposal"])
+        self.assertEqual(validate_handoff(payload_from_gate)["proposal_digest"], "sha256:" + "b" * 64)
+        self.assertEqual(encode_publish(GENERATION, ARTIFACT, payload_from_gate).split(b"|")[0], b"PUBLISH")
+
+    def test_reject_untyped_or_malformed_proposal_digest(self):
+        for value in ("b" * 64, "sha256:" + "b" * 63, "SHA256:" + "b" * 64,
+                      "sha256:" + "g" * 64, None, 123):
+            document = json.loads(self.payload)
+            document["proposal_digest"] = value
+            corrupted = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            with self.subTest(value=value), self.assertRaises(NativeStopDenied):
+                validate_handoff(corrupted)
+
     def test_raw_win32_byte_transport_explicit_framing(self):
         message = encode_publish(GENERATION, ARTIFACT, self.payload)
         response = ("PUBLISHED|" + ARTIFACT).encode()
@@ -223,3 +250,4 @@ class NativePipeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

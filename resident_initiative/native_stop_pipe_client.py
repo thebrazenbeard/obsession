@@ -21,6 +21,7 @@ PUBLISH_PIPE = r"\\.\pipe\VeraObsessionStopPublishV1"
 OUTPUT_ROOT = r"C:\Program Files\VERA\ObsessionStopCustodian\output"
 _GENERATION = re.compile(r"\A[a-zA-Z0-9_-]{8,96}\Z")
 _DIGEST = re.compile(r"\A[a-f0-9]{64}\Z")
+_PROPOSAL_DIGEST = re.compile(r"\Asha256:[a-f0-9]{64}\Z")
 _HANDOFF_KEYS = frozenset(("schema", "scope", "proposal_digest", "proposal",
                            "delivery_verified", "contact_authorized"))
 
@@ -60,7 +61,8 @@ def validate_handoff(payload):
     if (type(envelope) is not dict or frozenset(envelope) != _HANDOFF_KEYS
             or envelope["schema"] != "initiative.local-handoff.v1"
             or envelope["scope"] != "LOCAL_SYNTHETIC_HANDOFF_ONLY"
-            or not _DIGEST.fullmatch(str(envelope["proposal_digest"]))
+            or type(envelope["proposal_digest"]) is not str
+            or not _PROPOSAL_DIGEST.fullmatch(envelope["proposal_digest"])
             or envelope["delivery_verified"] is not False
             or envelope["contact_authorized"] is not False):
         raise NativeStopDenied("HANDOFF_SCOPE_OR_INTEGRITY_INVALID")
@@ -259,3 +261,4 @@ class NativeStopPublishClient:
         return {"path": str(PureWindowsPath(self.output_root) / (artifact_id + ".json")),
                 "receipt": answer, "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY",
                 "contact_authorized": False, "delivery_verified": False}
+
