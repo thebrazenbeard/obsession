@@ -14,7 +14,15 @@ not silently switch on transport failure.
 
 Each request/response is **one** UTF-8 string preceded by an unsigned 4-byte
 big-endian length; 1..8192 bytes. No newline terminator on the pipe frame.
-Service responds the same way. At most one active client per pipe in current
+Service sends the same framing, then **waits up to three seconds** for a
+response-bound acknowledgment frame `ACK|<sha256(response_bytes)>|V1` before
+disconnect. The client sends this only after reading the full response. The
+acknowledgment is transport receipt, never authorization; missing/invalid
+acknowledgment is not success and cannot undo an already completed STOP or
+publication effect. A client must reconcile/retry by idempotent protocol
+semantics if its acknowledgment was lost.
+
+At most one active client per pipe in current
 candidate; idle/partial clients are intended to time out in 3 seconds. 
 
 ### Operator

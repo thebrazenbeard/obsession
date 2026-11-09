@@ -10,6 +10,8 @@ Transport qualification on the actual Windows identity remains outstanding.
 from __future__ import annotations
 
 import base64
+import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import re
@@ -24,6 +26,7 @@ _DIGEST = re.compile(r"\A[a-f0-9]{64}\Z")
 _PROPOSAL_DIGEST = re.compile(r"\Asha256:[a-f0-9]{64}\Z")
 _HANDOFF_KEYS = frozenset(("schema", "scope", "proposal_digest", "proposal",
                            "delivery_verified", "contact_authorized"))
+_SERVICE_NAME = "VeraObsessionStopCustodian"
 
 
 class NativeStopDenied(PermissionError):
@@ -100,6 +103,74 @@ def frame(command):
     return len(command).to_bytes(4, "big") + command
 
 
+def _attest_windows_pipe_server(handle):
+    """Bind an open pipe handle to the exact RUNNING Windows SCM service PID.
+
+    A lookalike named-pipe server can forge PUBLISHED receipts while the real
+    service is down. A pipe name or successful connection is not server proof.
+    The kernel-reported creator PID for THIS handle must match SCM's running
+    SERVICE_WIN32_OWN_PROCESS PID. Windows/admin trust and genuine principal
+    separation remain external host qualification requirements.
+    """
+    # Win32 DWORD is always a 32-bit unsigned integer. ctypes.wintypes.DWORD
+    # maps to C unsigned long, which is 64 bits on a Unix LP64 mock host;
+    # writing the explicit ABI makes these structural tests discriminating.
+    dword = ctypes.c_uint32
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel.GetNamedPipeServerProcessId.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(dword))
+    kernel.GetNamedPipeServerProcessId.restype = wintypes.BOOL
+    advapi.OpenSCManagerW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                     dword)
+    advapi.OpenSCManagerW.restype = wintypes.HANDLE
+    advapi.OpenServiceW.argtypes = (wintypes.HANDLE, wintypes.LPCWSTR,
+                                   dword)
+    advapi.OpenServiceW.restype = wintypes.HANDLE
+    advapi.QueryServiceStatusEx.argtypes = (
+        wintypes.HANDLE, dword, ctypes.POINTER(wintypes.BYTE),
+        dword, ctypes.POINTER(dword))
+    advapi.QueryServiceStatusEx.restype = wintypes.BOOL
+    advapi.CloseServiceHandle.argtypes = (wintypes.HANDLE,)
+    advapi.CloseServiceHandle.restype = wintypes.BOOL
+
+    class ServiceStatusProcess(ctypes.Structure):
+        _fields_ = [(name, dword) for name in (
+            "service_type", "current_state", "controls_accepted", "win32_exit_code",
+            "service_specific_exit_code", "checkpoint", "wait_hint", "pid",
+            "service_flags")]
+
+    server_pid = dword(0)
+    if not kernel.GetNamedPipeServerProcessId(wintypes.HANDLE(handle),
+                                              ctypes.byref(server_pid)):
+        raise OSError(ctypes.get_last_error(), "cannot attest named-pipe peer PID")
+    if server_pid.value == 0:
+        raise PermissionError("named-pipe peer PID is invalid")
+
+    scm = advapi.OpenSCManagerW(None, None, 0x0001)  # SC_MANAGER_CONNECT
+    if not scm:
+        raise OSError(ctypes.get_last_error(), "cannot query SCM identity")
+    service = None
+    try:
+        service = advapi.OpenServiceW(scm, _SERVICE_NAME, 0x0004)  # SERVICE_QUERY_STATUS
+        if not service:
+            raise OSError(ctypes.get_last_error(), "cannot identify STOP custodian service")
+        status = ServiceStatusProcess()
+        needed = dword(0)
+        data = ctypes.cast(ctypes.byref(status), ctypes.POINTER(wintypes.BYTE))
+        if not advapi.QueryServiceStatusEx(service, 0, data, ctypes.sizeof(status),
+                                           ctypes.byref(needed)):
+            raise OSError(ctypes.get_last_error(), "cannot query STOP service process")
+        # SERVICE_WIN32_OWN_PROCESS=0x10, SERVICE_RUNNING=4.
+        if (status.service_type != 0x10 or status.current_state != 4
+                or status.pid == 0 or status.pid != server_pid.value):
+            raise PermissionError("named-pipe server is not the running STOP service")
+    finally:
+        if service:
+            advapi.CloseServiceHandle(service)
+        advapi.CloseServiceHandle(scm)
+
+
 class NativeNamedPipeChannel:
     """Bounded Windows overlapped byte-pipe transport; Windows test pending.
 
@@ -125,6 +196,13 @@ class NativeNamedPipeChannel:
             self.pipe, self.api.GENERIC_READ | self.api.GENERIC_WRITE,
             0, self.api.NULL, self.api.OPEN_EXISTING,
             self.api.FILE_FLAG_OVERLAPPED, self.api.NULL)
+        try:
+            # Attest before sending any command or accepting any receipt.
+            _attest_windows_pipe_server(self.handle)
+        except BaseException:
+            self.api.CloseHandle(self.handle)
+            self.handle = None
+            raise
         self.deadline = time.monotonic() + self.timeout
         # No SetNamedPipeHandleState(..., PIPE_READMODE_MESSAGE): native C#
         # server deliberately uses byte mode.
@@ -137,16 +215,31 @@ class NativeNamedPipeChannel:
 
     def _finish(self, overlapped, err):
         if err == self.api.ERROR_IO_PENDING:
-            deadline = self.deadline or time.monotonic() + self.timeout
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                overlapped.cancel()
-                raise TimeoutError("native pipe I/O deadline")
-            outcome = self.api.WaitForMultipleObjects(
-                [overlapped.event], False, max(1, int(remaining * 1000)))
-            if outcome != self.api.WAIT_OBJECT_0:
-                overlapped.cancel()
-                raise TimeoutError("native pipe I/O deadline")
+            try:
+                deadline = self.deadline or time.monotonic() + self.timeout
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("native pipe I/O deadline")
+                outcome = self.api.WaitForMultipleObjects(
+                    [overlapped.event], False, max(1, int(remaining * 1000)))
+                if outcome != self.api.WAIT_OBJECT_0:
+                    raise TimeoutError("native pipe I/O deadline")
+            except BaseException:
+                # CancelIoEx requests cancellation; it does not certify that
+                # the kernel has stopped using the overlapped I/O buffer.
+                # CPython's _winapi.Overlapped.cancel() clears `pending`, so
+                # discarding this object before a blocking result drain may
+                # prematurely release its read/write buffer. Match the drain
+                # convention in CPython multiprocessing.connection.
+                try:
+                    overlapped.cancel()
+                except OSError:
+                    pass
+                try:
+                    overlapped.GetOverlappedResult(True)
+                except OSError:
+                    pass
+                raise
         count, error = overlapped.GetOverlappedResult(True)
         if error:
             raise OSError(error, "native pipe I/O failed")
@@ -246,9 +339,18 @@ class NativeStopPublishClient:
                 if not channel.poll(self._timeout):
                     raise NativeStopDenied("CUSTODIAN_RESPONSE_TIMEOUT")
                 reply = channel.recv_bytes(maxlength=4096)
+                # Native service holds its pipe connected until it receives
+                # this transport-only receipt of the exact response bytes.
+                # No publication authority is conveyed by ACK. A failed ACK
+                # must never be promoted into a successful resident receipt.
+                ack = ("ACK|" + hashlib.sha256(reply).hexdigest() + "|V1").encode("ascii")
+                channel.send_bytes(ack)
         except NativeStopDenied:
             raise
-        except (OSError, EOFError, BufferError, ValueError, TypeError) as exc:
+        except (ImportError, AttributeError, OSError, EOFError,
+                BufferError, ValueError, TypeError) as exc:
+            # Explicit selection on a non-Windows Python runtime must deny
+            # publication when `_winapi` or `ctypes.WinDLL` is unavailable.
             raise NativeStopDenied("CUSTODIAN_PIPE_UNAVAILABLE") from exc
         try:
             answer = reply.decode("utf-8", "strict")

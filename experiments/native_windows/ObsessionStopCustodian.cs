@@ -3,6 +3,7 @@
 // .NET Framework 4.x, Windows Service, no third-party dependencies.
 // Protected host output is LOCAL_SYNTHETIC_HANDOFF_ONLY, never a recipient send.
 using System;
+using System.ComponentModel;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -14,6 +15,8 @@ using System.Security.Principal;
 using System.ServiceProcess;
 using System.Web.Script.Serialization;
 using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -29,8 +32,14 @@ namespace Vera.ObsessionStop
 #else
         private const string Root = @"C:\Program Files\VERA\ObsessionStopCustodian";
 #endif
+#if STAGING_SELFTEST
+        // Selftests never claim or probe the real production pipe names.
+        private static readonly string OperatorPipe = "VeraObsessionStopOperatorStageV1_" + Process.GetCurrentProcess().Id;
+        private static readonly string PublishPipe = "VeraObsessionStopPublishStageV1_" + Process.GetCurrentProcess().Id;
+#else
         private const string OperatorPipe = "VeraObsessionStopOperatorV1";
         private const string PublishPipe = "VeraObsessionStopPublishV1";
+#endif
         private static readonly Regex Generation = new Regex(@"\A[a-zA-Z0-9_-]{8,96}\z", RegexOptions.Compiled);
         private static readonly Regex ArtifactId = new Regex(@"\A[a-f0-9]{64}\z", RegexOptions.Compiled);
         private static readonly Regex Digest = new Regex(@"\A[a-f0-9]{64}\z", RegexOptions.Compiled);
@@ -56,6 +65,39 @@ namespace Vera.ObsessionStop
         private SecurityIdentifier residentSid;
         private Thread operatorThread;
         private Thread publishThread;
+
+        // The stock NamedPipeServerStream name-taking constructor does not
+        // request FILE_FLAG_FIRST_PIPE_INSTANCE. Reserve both names *before*
+        // SCM acknowledges start; never release/recreate them between clients.
+        private const uint PipeAccessDuplex = 0x00000003;
+        private const uint FileFlagOverlapped = 0x40000000;
+        private const uint FileFlagFirstInstance = 0x00080000;
+        private const uint PipeRejectRemoteClients = 0x00000008;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SecurityAttributes
+        {
+            public int Length;
+            public IntPtr SecurityDescriptor;
+            [MarshalAs(UnmanagedType.Bool)] public bool InheritHandle;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafePipeHandle CreateNamedPipe(
+            string fullName, uint openMode, uint pipeMode, uint maxInstances,
+            uint outBufferSize, uint inBufferSize, uint timeout,
+            ref SecurityAttributes attributes);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CancelIoEx(SafePipeHandle file, IntPtr overlapped);
+
+        // A deadline whose outstanding asynchronous callback cannot be
+        // settled means this retained first-instance pipe must not be reused.
+        private sealed class FatalPipeIoException : IOException
+        {
+            public FatalPipeIoException(string reason) : base(reason) { }
+        }
 
         private struct Grant
         {
@@ -646,16 +688,44 @@ namespace Vera.ObsessionStop
                 int timeout = RemainingMilliseconds(deadline);
                 IAsyncResult pending = s.BeginRead(b, offset, count, null, null);
                 int got;
-                using (WaitHandle completed = pending.AsyncWaitHandle)
+                WaitHandle completed = pending.AsyncWaitHandle;
+                if (!completed.WaitOne(timeout))
                 {
-                    if (!completed.WaitOne(timeout))
-                        throw new IOException("whole-frame pipe deadline");
-                    got = s.EndRead(pending);
+                    SettleExpiredPipeIo(s, pending, completed, false);
+                    throw new IOException("whole-frame pipe deadline");
                 }
+                try { got = s.EndRead(pending); }
+                finally { completed.Close(); }
                 if (got <= 0) throw new EndOfStreamException();
                 offset += got;
                 count -= got;
             }
+        }
+
+        private static void SettleExpiredPipeIo(Stream stream, IAsyncResult pending,
+                                                WaitHandle completion, bool writing)
+        {
+            // A timed-out APM operation remains live. Closing AsyncWaitHandle
+            // before PipeStream.AsyncPSCallback signals it can terminate the
+            // process with ObjectDisposedException (observed on Windows).
+            PipeStream pipe = stream as PipeStream;
+            if (pipe == null)
+                throw new FatalPipeIoException("timed-out operation is not a pipe");
+            bool requested = CancelIoEx(pipe.SafePipeHandle, IntPtr.Zero);
+            int error = Marshal.GetLastWin32Error();
+            // ERROR_NOT_FOUND: the I/O already completed at cancellation time.
+            if (!requested && error != 1168)
+                throw new FatalPipeIoException("overlapped pipe cancellation failed");
+            if (!completion.WaitOne(1500))
+                throw new FatalPipeIoException("overlapped pipe cancellation did not settle");
+            try
+            {
+                if (writing) stream.EndWrite(pending);
+                else stream.EndRead(pending);
+            }
+            catch (IOException) { /* Expected ERROR_OPERATION_ABORTED. */ }
+            catch (OperationCanceledException) { /* Canceled after deadline. */ }
+            finally { completion.Close(); }
         }
 
         private static void WriteFrame(Stream s, string message)
@@ -670,16 +740,64 @@ namespace Vera.ObsessionStop
             s.Flush();
         }
 
+        private static string ResponseReadAck(string response)
+        {
+            // The response frame itself is not proof of delivery: on Windows,
+            // DisconnectNamedPipe discards unread data buffered for the client,
+            // while PipeStream.Flush does not wait for the client to consume it.
+            // Bind the application's read acknowledgment to the exact reply.
+            return "ACK|" + Sha256Hex(new UTF8Encoding(false, true).GetBytes(response))
+                + "|V1";
+        }
+
+        private static bool AwaitResponseReadAck(Stream s, string response)
+        {
+            // The peer acknowledges only *after* reading the entire reply.
+            // An absent/invalid ACK is NOT a successful delivery receipt and
+            // never extends the 3-second whole-frame deadline indefinitely.
+            try
+            {
+                return String.Equals(DecodeUtf8(ReadFrame(s)), ResponseReadAck(response),
+                                     StringComparison.Ordinal);
+            }
+            catch (FatalPipeIoException) { throw; }
+            catch (IOException) { return false; }
+            catch (DecoderFallbackException) { return false; }
+        }
+
+        private static void CompletePendingConnectOnStop(NamedPipeServerStream pipe,
+                                                          IAsyncResult pending)
+        {
+            // EndWaitForConnection owns/closes its asynchronous wait event;
+            // every BeginWaitForConnection must settle before pipe disposal.
+            WaitHandle completion = pending.AsyncWaitHandle;
+            if (!completion.WaitOne(0))
+            {
+                bool requested = CancelIoEx(pipe.SafePipeHandle, IntPtr.Zero);
+                int error = Marshal.GetLastWin32Error();
+                if (!requested && error != 1168)
+                    throw new FatalPipeIoException("pending connect cancellation failed");
+                if (!completion.WaitOne(1500))
+                    throw new FatalPipeIoException("pending connect cancellation did not settle");
+            }
+            try { pipe.EndWaitForConnection(pending); }
+            catch (IOException) { /* ERROR_OPERATION_ABORTED or peer dropped. */ }
+            catch (OperationCanceledException) { /* Expected cancellation. */ }
+        }
+
         private static void WriteWithDeadline(Stream stream, byte[] buffer,
                                               long deadline)
         {
             int timeout = RemainingMilliseconds(deadline);
             IAsyncResult pending = stream.BeginWrite(buffer, 0, buffer.Length, null, null);
-            using (WaitHandle completed = pending.AsyncWaitHandle)
+            WaitHandle completed = pending.AsyncWaitHandle;
+            if (!completed.WaitOne(timeout))
             {
-                if (!completed.WaitOne(timeout)) throw new IOException("whole-frame pipe deadline");
-                stream.EndWrite(pending);
+                SettleExpiredPipeIo(stream, pending, completed, true);
+                throw new IOException("whole-frame pipe deadline");
             }
+            try { stream.EndWrite(pending); }
+            finally { completed.Close(); }
         }
 
         private static string DecodeUtf8(byte[] b)
@@ -697,63 +815,463 @@ namespace Vera.ObsessionStop
             acl.AddAccessRule(new PipeAccessRule(
                 new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
                 PipeAccessRights.FullControl, AccessControlType.Allow));
+#if STAGING_PIPE_TEST
+            // Test-only loopback identity on BOTH isolated pipe endpoints.
+            // Never included in a production binary.
+            acl.AddAccessRule(new PipeAccessRule(
+                WindowsIdentity.GetCurrent().User,
+                PipeAccessRights.FullControl, AccessControlType.Allow));
+#endif
             if (!operatorAccess)
                 acl.AddAccessRule(new PipeAccessRule(residentSid, PipeAccessRights.ReadWrite,
                                                      AccessControlType.Allow));
             return acl;
         }
 
-        private void ServePipe(bool operatorAccess)
+        private NamedPipeServerStream CreateExclusivePipe(bool operatorAccess)
         {
-            while (running)
+            byte[] securityDescriptor = PipeAcl(operatorAccess).GetSecurityDescriptorBinaryForm();
+            IntPtr descriptor = Marshal.AllocHGlobal(securityDescriptor.Length);
+            try
             {
+                Marshal.Copy(securityDescriptor, 0, descriptor, securityDescriptor.Length);
+                SecurityAttributes attributes = new SecurityAttributes {
+                    Length = Marshal.SizeOf(typeof(SecurityAttributes)),
+                    SecurityDescriptor = descriptor,
+                    InheritHandle = false
+                };
+                string fullName = @"\\.\pipe\" + (operatorAccess ? OperatorPipe : PublishPipe);
+                SafePipeHandle handle = CreateNamedPipe(fullName,
+                    PipeAccessDuplex | FileFlagOverlapped | FileFlagFirstInstance,
+                    PipeRejectRemoteClients, 1, 4096, 4096, 3000, ref attributes);
+                if (handle == null || handle.IsInvalid)
+                {
+                    int code = Marshal.GetLastWin32Error();
+                    if (handle != null) handle.Dispose();
+                    throw new Win32Exception(code, "exclusive STOP pipe reservation failed");
+                }
                 try
                 {
-                    using (NamedPipeServerStream pipe = new NamedPipeServerStream(
-                        operatorAccess ? OperatorPipe : PublishPipe,
-                        PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous, 0, 0, PipeAcl(operatorAccess)))
+                    return new NamedPipeServerStream(PipeDirection.InOut, true, false, handle);
+                }
+                catch
+                {
+                    handle.Dispose();
+                    throw;
+                }
+            }
+            finally { Marshal.FreeHGlobal(descriptor); }
+        }
+
+        private static void DisconnectOrFail(NamedPipeServerStream pipe)
+        {
+            try
+            {
+                // Microsoft .NET Framework permits Disconnect from BOTH
+                // Connected and Broken states. After the client closes,
+                // IsConnected becomes false while the server handle remains
+                // in Broken state; skipping Disconnect poisons the retained
+                // first-instance handle's next BeginWaitForConnection.
+                pipe.Disconnect();
+            }
+            catch (IOException)
+            {
+                // If the required state transition fails, reusing this
+                // first-instance handle would report false service health.
+                throw new FatalPipeIoException("pipe could not transition to Disconnected state");
+            }
+            catch (InvalidOperationException)
+            {
+                throw new FatalPipeIoException("pipe state invalid at required disconnect");
+            }
+        }
+
+        private void ServePipe(bool operatorAccess, NamedPipeServerStream pipe)
+        {
+            try
+            {
+                // Keep each first-instance pipe handle for the service lifetime.
+                // Reopening it by name between requests creates a squatting gap.
+                using (pipe)
+                {
+#if STAGING_PIPE_TEST
+                    int stageConnections = 0;
+#endif
+                    while (running)
                     {
                         IAsyncResult pending = pipe.BeginWaitForConnection(null, null);
                         while (running && !pending.AsyncWaitHandle.WaitOne(250)) { }
-                        if (!running) break;
+                        if (!running)
+                        {
+                            CompletePendingConnectOnStop(pipe, pending);
+                            break;
+                        }
                         pipe.EndWaitForConnection(pending);
+#if STAGING_PIPE_TEST
+                        stageConnections++;
+                        Console.WriteLine("PIPE_DIAGNOSTIC server_connected="
+                            + (operatorAccess ? "operator" : "publish")
+                            + ";index=" + stageConnections);
+#endif
                         string answer;
+                        bool peerStillPresent = true;
                         try
                         {
                             string request = DecodeUtf8(ReadFrame(pipe));
                             answer = operatorAccess ? OperatorCommand(request) : PublishCommand(request);
                         }
+                        catch (FatalPipeIoException) { throw; }
+                        catch (EndOfStreamException)
+                        {
+                            // Abruptly disconnected clients have not submitted
+                            // a complete request and cannot consume any reply.
+                            // Writing a meaningless HOLD to the abandoned
+                            // handle and awaiting its ACK stalls reconnection.
+                            peerStillPresent = false;
+                            answer = null;
+#if STAGING_PIPE_TEST
+                            Console.WriteLine("PIPE_DIAGNOSTIC disconnected_mid_request="
+                                + (operatorAccess ? "operator" : "publish")
+                                + ";index=" + stageConnections);
+#endif
+                        }
                         catch (Exception) { answer = "HOLD|MALFORMED_OR_FAILED"; }
-                        WriteFrame(pipe, answer);
+                        if (peerStillPresent)
+                        {
+                            try
+                            {
+                                WriteFrame(pipe, answer);
+#if STAGING_PIPE_TEST
+                                bool acknowledged = AwaitResponseReadAck(pipe, answer);
+                                Console.WriteLine("PIPE_DIAGNOSTIC response_read_ack="
+                                    + (acknowledged ? "yes" : "no") + ";index=" + stageConnections);
+#else
+                                AwaitResponseReadAck(pipe, answer);
+#endif
+                            }
+                            catch (FatalPipeIoException) { throw; }
+                            catch (IOException)
+                            {
+                                // The peer may close after command processing.
+                                // Preserve the reserved first-instance handle.
+                            }
+                        }
+                        if (!running) break;
+                        DisconnectOrFail(pipe);
+#if STAGING_PIPE_TEST
+                        Console.WriteLine("PIPE_DIAGNOSTIC server_disconnected="
+                            + (operatorAccess ? "operator" : "publish")
+                            + ";index=" + stageConnections
+                            + ";is_connected=" + pipe.IsConnected);
+#endif
                     }
                 }
-                catch (Exception)
+            }
+            catch (Exception error)
+            {
+                // A lost exclusive handle is a fatal service-integrity failure;
+                // never expose a RUNNING service with an unowned pipe name.
+#if STAGING_PIPE_TEST
+                Console.Error.WriteLine("PIPE_FATAL listener="
+                    + (operatorAccess ? "operator" : "publish")
+                    + ";type=" + error.GetType().FullName
+                    + ";message=" + error.Message.Replace('\r', ' ').Replace('\n', ' ')
+                    + ";stack=" + error.StackTrace);
+#endif
+                bool unexpected;
+                lock (gate)
                 {
-                    // No provider-driven bypass to publication. Failed requests
-                    // remain denied; the service must be monitored externally.
-                    Thread.Sleep(250);
+                    unexpected = running;
+                    healthy = false;
+                    running = false;
                 }
+                if (unexpected || error is FatalPipeIoException)
+                    Environment.FailFast("STOP custodian pipe integrity lost", error);
             }
         }
 
         protected override void OnStart(string[] args)
         {
             LoadState(); // fail before pipes expose any publication capability
-            running = true;
-            operatorThread = new Thread(() => ServePipe(true));
-            publishThread = new Thread(() => ServePipe(false));
-            operatorThread.IsBackground = true;
-            publishThread.IsBackground = true;
-            operatorThread.Start();
-            publishThread.Start();
+            NamedPipeServerStream operatorPipe = null;
+            NamedPipeServerStream publishPipe = null;
+            try
+            {
+                // Reserve BOTH names synchronously before SCM reports RUNNING.
+                // A pre-bound same-name pipe makes startup fail closed.
+                operatorPipe = CreateExclusivePipe(true);
+                publishPipe = CreateExclusivePipe(false);
+                running = true;
+                NamedPipeServerStream capturedOperator = operatorPipe;
+                NamedPipeServerStream capturedPublish = publishPipe;
+                operatorThread = new Thread(() => ServePipe(true, capturedOperator));
+                publishThread = new Thread(() => ServePipe(false, capturedPublish));
+                operatorThread.IsBackground = true;
+                publishThread.IsBackground = true;
+                operatorThread.Start();
+                publishThread.Start();
+            }
+            catch
+            {
+                lock (gate) { healthy = false; running = false; }
+                if (operatorPipe != null) operatorPipe.Dispose();
+                if (publishPipe != null) publishPipe.Dispose();
+                throw;
+            }
         }
 
         protected override void OnStop()
         {
-            running = false;
+            // Commands hold gate through durable side effects. Acquiring it
+            // before SCM stop-ack prevents an in-flight PUBLISH from committing
+            // AFTER the service has acknowledged stopping.
+            lock (gate) { healthy = false; running = false; }
+            bool operatorDrained = operatorThread == null || operatorThread.Join(10000);
+            bool publishDrained = publishThread == null || publishThread.Join(10000);
+            if (!operatorDrained || !publishDrained)
+                throw new IOException("STOP custodian worker drain unverified");
         }
 
+#if STAGING_PIPE_TEST
+        private static string StageExchange(string pipeName, string request)
+        {
+            using (NamedPipeClientStream client = new NamedPipeClientStream(
+                ".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+            {
+                client.Connect(3000);
+                WriteFrame(client, request);
+                string response = DecodeUtf8(ReadFrame(client));
+                WriteFrame(client, ResponseReadAck(response));
+                return response;
+            }
+        }
+
+        private static string StageBadLength(string pipeName)
+        {
+            using (NamedPipeClientStream client = new NamedPipeClientStream(
+                ".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+            {
+                client.Connect(3000);
+                // A frame larger than the source's 8192-byte ceiling.
+                byte[] oversize = new byte[] { 0, 0, 32, 1 };
+                client.Write(oversize, 0, oversize.Length);
+                client.Flush();
+                string response = DecodeUtf8(ReadFrame(client));
+                WriteFrame(client, ResponseReadAck(response));
+                return response;
+            }
+        }
+
+        private static void StageAbruptDisconnectBurst(string pipeName, int count)
+        {
+            // Close each client after writing an incomplete length prefix.
+            // The retained first-instance listener must recover without
+            // losing its name or violating asynchronous callback lifetime.
+            Stopwatch elapsed = Stopwatch.StartNew();
+            for (int i = 0; i < count; i++)
+            {
+                using (NamedPipeClientStream client = new NamedPipeClientStream(
+                    ".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+                {
+                    try { client.Connect(3000); }
+                    catch (System.TimeoutException)
+                    {
+                        Console.Error.WriteLine("PIPE_TEST_FAILURE abrupt_disconnect_connect"
+                            + "_index=" + i + ";elapsed_ms=" + elapsed.ElapsedMilliseconds);
+                        throw;
+                    }
+                    byte[] incomplete = new byte[] { 0, 0 };
+                    client.Write(incomplete, 0, incomplete.Length);
+                    client.Flush();
+                }
+            }
+            Console.WriteLine("PIPE_TEST abrupt_disconnects=" + count);
+            Console.WriteLine("PIPE_DIAGNOSTIC abrupt_disconnect_duration_ms="
+                + elapsed.ElapsedMilliseconds);
+        }
+
+        private static string StageDripTimeout(string pipeName)
+        {
+            using (NamedPipeClientStream client = new NamedPipeClientStream(
+                ".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+            {
+                client.Connect(3000);
+                // Header promises a ten-byte request, but the client provides
+                // only the first two payload bytes. The server must issue HOLD
+                // after its single whole-frame 3-second deadline.
+                byte[] partial = new byte[] { 0, 0, 0, 10, (byte)'S', (byte)'T' };
+                client.Write(partial, 0, partial.Length);
+                client.Flush();
+                Thread.Sleep(3600);
+                // Windows named-pipe Disconnect can discard a queued HOLD
+                // before the client consumes it. A closed pipe is a valid
+                // fail-closed transport outcome, but not a positive reply.
+                try
+                {
+                    string response = DecodeUtf8(ReadFrame(client));
+                    WriteFrame(client, ResponseReadAck(response));
+                    return response;
+                }
+                catch (EndOfStreamException) { return "CLOSED_WITHOUT_ACK"; }
+                catch (IOException error)
+                {
+                    if (error.Message == "whole-frame pipe deadline") throw;
+                    return "CLOSED_WITHOUT_ACK";
+                }
+            }
+        }
+
+        private static void StageRequire(string label, string actual, string expected)
+        {
+            Console.WriteLine("PIPE_TEST " + label + "=" + actual);
+            if (!String.Equals(actual, expected, StringComparison.Ordinal))
+            {
+                Console.Error.WriteLine("PIPE_TEST_FAILURE " + label + " expected=" + expected);
+                Environment.ExitCode = 1;
+            }
+        }
+
+        private static void StageRequireTimeoutDenial(string actual)
+        {
+            Console.WriteLine("PIPE_TEST whole_frame_timeout=" + actual);
+            if (actual != "HOLD|MALFORMED_OR_FAILED" && actual != "CLOSED_WITHOUT_ACK")
+            {
+                Console.Error.WriteLine("PIPE_TEST_FAILURE whole_frame_timeout"
+                    + " unexpected_ack=" + actual);
+                Environment.ExitCode = 1;
+            }
+        }
+
+        private static void StagePipeExercise(string sourcePayload, string originalGeneration,
+                                              string originalTypedArtifact)
+        {
+            string generation = "staging_pipe_generation_0002";
+            string artifact = new string('d', 64);
+            string payloadText = sourcePayload.Replace(originalGeneration, generation)
+                .Replace(originalTypedArtifact, "sha256:" + artifact);
+            byte[] payload = Encoding.UTF8.GetBytes(payloadText);
+            string digest = Sha256Hex(payload);
+            string publish = "PUBLISH|" + generation + "|" + artifact + "|"
+                + Convert.ToBase64String(payload) + "|V1";
+            string grant = "GRANT|" + generation + "|" + artifact + "|" + digest
+                + "|" + DateTime.UtcNow.AddMinutes(2).Ticks + "|V1";
+            // The same production command/handler code below runs through
+            // actual Windows BYTE-mode named pipes, without any SCM service.
+            StopCustodian stage = new StopCustodian();
+            stage.OnStart(new string[0]);
+            try
+            {
+                StageRequire("publish_before_grant", StageExchange(PublishPipe, publish),
+                             "HOLD|NO_PROTECTED_OWNER_GRANT");
+                StageRequire("operator_command_on_publish_pipe",
+                             StageExchange(PublishPipe, "STOP|" + generation + "|V1"),
+                             "HOLD|INVALID_PUBLISH_REQUEST");
+                StageRequire("publish_command_on_operator_pipe",
+                             StageExchange(OperatorPipe, publish),
+                             "HOLD|UNRECOGNIZED_OPERATOR_COMMAND");
+                StageRequire("invalid_expiry", StageExchange(OperatorPipe,
+                    "GRANT|" + generation + "|" + artifact + "|" + digest
+                    + "|" + DateTime.UtcNow.AddHours(2).Ticks + "|V1"),
+                    "HOLD|EXPIRY_INVALID");
+                StageRequire("bad_frame_length", StageBadLength(PublishPipe),
+                             "HOLD|MALFORMED_OR_FAILED");
+                StageRequireTimeoutDenial(StageDripTimeout(PublishPipe));
+                StageRequire("post_timeout_recovery", StageExchange(PublishPipe, publish),
+                             "HOLD|NO_PROTECTED_OWNER_GRANT");
+                StageAbruptDisconnectBurst(PublishPipe, 100);
+                StageRequire("post_disconnect_burst_recovery", StageExchange(PublishPipe, publish),
+                             "HOLD|NO_PROTECTED_OWNER_GRANT");
+                StageRequire("grant", StageExchange(OperatorPipe, grant), "GRANTED|" + artifact);
+                StageRequire("publish", StageExchange(PublishPipe, publish), "PUBLISHED|" + artifact);
+                StageRequire("idempotent_publish", StageExchange(PublishPipe, publish),
+                             "ALREADY_PRESENT|" + artifact);
+                StageRequire("stop", StageExchange(OperatorPipe,
+                             "STOP|" + generation + "|V1"), "STOPPED|" + generation);
+                StageRequire("publish_after_stop", StageExchange(PublishPipe, publish),
+                             "HOLD|STOP_ACTIVE_OR_UNVERIFIED");
+                StageRequire("grant_after_stop", StageExchange(OperatorPipe, grant),
+                             "HOLD|GENERATION_REVOKED");
+                string output = PathInside("output");
+                if (!File.Exists(Path.Combine(output, artifact + ".json")))
+                {
+                    Console.Error.WriteLine("PIPE_TEST_FAILURE no isolated synthetic output");
+                    Environment.ExitCode = 1;
+                }
+                Console.WriteLine("PIPE_TEST_MODE=STAGING_ONLY;PIPE_NAMESPACE=PROCESS_LOCAL"
+                    + ";CONTACT_DISABLED=true;CROSS_IDENTITY_ACL=UNVERIFIED");
+            }
+            finally { stage.OnStop(); }
+        }
+
+        private static void StageCollisionProbe()
+        {
+            // Reserve operator name first, then prove patched OnStart fails
+            // closed rather than falsely acknowledging readiness.
+            StopCustodian stage = new StopCustodian();
+            stage.LoadState();
+            bool rejected = false;
+            string diagnostic = "UNATTEMPTED";
+            using (NamedPipeServerStream squatter = stage.CreateExclusivePipe(true))
+            {
+                try { stage.OnStart(new string[0]); }
+                catch (Win32Exception ex)
+                {
+                    diagnostic = "WIN32_" + ex.NativeErrorCode;
+                    rejected = ex.NativeErrorCode == 5 || ex.NativeErrorCode == 231;
+                }
+                catch (Exception ex) { diagnostic = ex.GetType().FullName; }
+                if (!rejected)
+                {
+                    Console.Error.WriteLine("COLLISION_FAIL_CLOSED=FAIL;diagnostic=" + diagnostic);
+                    Environment.ExitCode = 2;
+                }
+                else if (stage.healthy || stage.running)
+                {
+                    Console.Error.WriteLine("COLLISION_FAIL_CLOSED=FAIL;healthy_or_running");
+                    Environment.ExitCode = 2;
+                }
+                else
+                {
+                    Console.WriteLine("COLLISION_FAIL_CLOSED=PASS;diagnostic=" + diagnostic
+                        + ";START_DENIED_BEFORE_SCM_ACK=true;STAGING_ONLY=true");
+                }
+                if (stage.running) stage.OnStop();
+            }
+        }
+
+        private static void StageIdentityWindow()
+        {
+            StopCustodian stage = new StopCustodian();
+            stage.OnStart(new string[0]);
+            try
+            {
+                Console.WriteLine("IDENTITY_WINDOW stage_operator_pipe=\\\\.\\pipe\\" + OperatorPipe);
+                Console.WriteLine("IDENTITY_WINDOW stage_publish_pipe=\\\\.\\pipe\\" + PublishPipe);
+                Console.WriteLine("IDENTITY_WINDOW current_user_sid="
+                    + WindowsIdentity.GetCurrent().User.Value);
+                Console.WriteLine("IDENTITY_WINDOW seconds=45"
+                    + ";SECONDARY_USER_MUST_NOT_BE_ADMIN_OR_SYSTEM"
+                    + ";CROSS_IDENTITY_ACL=UNVERIFIED_UNTIL_PROBED");
+                Thread.Sleep(45000);
+            }
+            finally { stage.OnStop(); }
+        }
+
+        private static void StageIdleStopStress()
+        {
+            // Exercise the BeginWaitForConnection -> OnStop cancellation path,
+            // distinct from an existing stop-after-command test.
+            for (int i = 0; i < 40; i++)
+            {
+                StopCustodian stage = new StopCustodian();
+                stage.OnStart(new string[0]);
+                Thread.Sleep(20);
+                stage.OnStop();
+            }
+            Console.WriteLine("PIPE_TEST idle_stop_restarts=40;"
+                + "PENDING_CONNECT_END_REQUIRED=true;STAGING_ONLY=true");
+        }
+#endif
         public static void Main()
         {
 #if STAGING_SELFTEST
@@ -834,9 +1352,42 @@ namespace Vera.ObsessionStop
             StopCustodian restarted = new StopCustodian();
             restarted.LoadState();
             string afterRestart = restarted.PublishCommand(envelope);
+            // These selftests use per-PID stage-only pipe names, never the
+            // production pipe names. The second first-instance bind must fail.
+            bool collisionDenied = false;
+            bool reacquireAfterRelease = false;
+            string collisionDiagnostic = "UNATTEMPTED";
+            using (NamedPipeServerStream reserved = restarted.CreateExclusivePipe(false))
+            {
+                try
+                {
+                    using (NamedPipeServerStream unexpected = restarted.CreateExclusivePipe(false))
+                        collisionDiagnostic = "SECOND_BIND_SUCCEEDED";
+                }
+                catch (Win32Exception ex)
+                {
+                    collisionDiagnostic = "WIN32_" + ex.NativeErrorCode;
+                    // ERROR_ACCESS_DENIED (5): first-instance collision.
+                    // ERROR_PIPE_BUSY (231): the single permitted instance
+                    // is already reserved. Both reject a second server.
+                    collisionDenied = ex.NativeErrorCode == 5 || ex.NativeErrorCode == 231;
+                }
+                catch (Exception ex)
+                {
+                    collisionDiagnostic = "OTHER_" + ex.GetType().FullName + "_" + ex.Message;
+                }
+            }
+            using (NamedPipeServerStream reacquired = restarted.CreateExclusivePipe(false))
+                reacquireAfterRelease = reacquired != null;
+            restarted.OnStop();
+            bool stopQuiesced = !restarted.healthy && !restarted.running;
             Console.WriteLine("TEST_ONLY grant=" + grantResult + " first=" + first
                 + " stopped=" + stopped + " afterStop=" + afterStop
                 + " afterRestart=" + afterRestart
+                + " collisionDenied=" + collisionDenied
+                + " collisionDiagnostic=" + collisionDiagnostic
+                + " reacquireAfterRelease=" + reacquireAfterRelease
+                + " stopQuiesced=" + stopQuiesced
                 + " rawDigest=" + deniedRawDigest + " unsafeNested=" + deniedUnsafeNested
                 + " dupTop=" + deniedDuplicateTop + " dupNested=" + deniedDuplicateNested
                 + " escapedKey=" + deniedEscapedNestedKey
@@ -849,8 +1400,26 @@ namespace Vera.ObsessionStop
                 || deniedUnsafeNested != "HOLD|NOT_SYNTHETIC_HANDOFF"
                 || deniedDuplicateTop != "HOLD|NOT_SYNTHETIC_HANDOFF"
                 || deniedDuplicateNested != "HOLD|NOT_SYNTHETIC_HANDOFF"
-                || deniedEscapedNestedKey != "HOLD|NOT_SYNTHETIC_HANDOFF")
+                || deniedEscapedNestedKey != "HOLD|NOT_SYNTHETIC_HANDOFF"
+                || !collisionDenied || !reacquireAfterRelease || !stopQuiesced)
                 Environment.ExitCode = 1;
+#if STAGING_PIPE_TEST
+            string[] stageArgs = Environment.GetCommandLineArgs();
+            if (stageArgs.Length == 2 && stageArgs[1] == "--collision")
+                StageCollisionProbe();
+            else if (stageArgs.Length == 2 && stageArgs[1] == "--idle-stop-stress")
+                StageIdleStopStress();
+            else if (stageArgs.Length == 2 && stageArgs[1] == "--identity-window")
+                StageIdentityWindow();
+            else if (stageArgs.Length == 1)
+                StagePipeExercise(payloadText, generation, typedArtifact);
+            else
+            {
+                Console.Error.WriteLine("USAGE: Wave12.Stage.exe"
+                    + " [--collision|--identity-window|--idle-stop-stress]");
+                Environment.ExitCode = 64;
+            }
+#endif
 #else
             ServiceBase.Run(new StopCustodian());
 #endif
