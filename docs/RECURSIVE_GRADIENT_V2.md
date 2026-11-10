@@ -48,18 +48,23 @@ difference; the canned synthetic replies are intentionally constant.
 With `--backend-config PRIVATE_APPROVED_BROKER_CONFIG`, it instead makes
 four finite calls through the **already running authenticated local broker**
 and additionally requires stable A/A and B/B *response* hashes and a different
-A/B response before labeling context sensitivity observed. The broker fixes
+A/B response before reporting **byte-comparison PASS, semantics UNVERIFIED**.
+This does not rate topic relevance, factual accuracy, or counterevidence uptake;
+punctuation-only differences can satisfy the byte condition. The broker fixes
 temperature and seed in its source, but the script does not independently
 attest model weights, decoding determinism or hardware. A mere request-digest
-PASS is not a response-effect PASS. Real mode must run only in an approved idle
+PASS is not a semantic response-effect PASS. Real mode must run only in an approved idle
 window; no broker, model, phone or messaging service is started here.
 
 ## Limits
 
 - Synthetic/runtime source tests are **not real local-model testing**.
-- A real reply difference would establish input-context sensitivity only,
+- A real reply difference would establish byte-level input-context sensitivity only,
   not autonomous motivation, subjective feeling, model weight changes,
   self-learning or the sought Vera identity.
+- `qualify_semantics.py` can create an effectless, counterbalanced plan for
+  synthetic held-out cases and selected-topic/trace/priority/probability
+  ablations. No independent blind semantic review or model call is implied.
 - SQLite hashes detect inconsistent local records but do not establish
   tamper-proof authority against a privileged whole-database rollback.
 - Topics (`transit`, `irrigation`) are deliberately synthetic; this research

@@ -5,8 +5,10 @@ authenticated loopback broker and `--backend-config`. This script NEVER starts
 Ollama, installs services, sends a message, or reads a person's conversation.
 Run only in an idle, owner-approved host window with an unused broker budget.
 
-Results prove host-directed prompt coupling, not inner feelings, persistent
-desire, weight updates or self-learning. A lexical shift alone is not enough.
+Results establish at most host-directed prompt coupling and reproducible reply
+*byte differences*. A lexical shift can satisfy the byte comparison; semantic
+change, inner feelings, persistent desire, weight updates, and self-learning
+are not tested here.
 """
 from __future__ import annotations
 
@@ -123,14 +125,18 @@ def execute(root: Path, *, backend_config: Path | None = None) -> dict:
         response_stable_a = a1["response_sha256"] == a2["response_sha256"]
         response_stable_b = b1["response_sha256"] == b2["response_sha256"]
         response_changed = a1["response_sha256"] != b1["response_sha256"]
-        response_effect = real and prompt_pass and response_stable_a and response_stable_b and response_changed
-        status = ("PASS" if prompt_pass and (not real or response_effect) else "INCONCLUSIVE")
+        response_byte_difference = (real and prompt_pass and response_stable_a
+                                    and response_stable_b and response_changed)
+        status = ("BYTE_COMPARISON_PASS_SEMANTIC_UNVERIFIED" if response_byte_difference
+                  else "PASS" if prompt_pass and not real else "INCONCLUSIVE")
         return {"schema": "initiative.recursive-paired.v1", "status": status,
                 "evidence_class": ("AUTHENTICATED_LOCAL_BROKER_UNATTESTED" if real
                                    else "SYNTHETIC_RUNTIME_INPUT_TEST"),
                 "prompt_coupling_status": "PASS" if prompt_pass else "INCONCLUSIVE",
-                "behavioral_response_effect": ("OBSERVED_CONTEXT_SENSITIVITY_UNATTESTED" if response_effect
-                                                else "INCONCLUSIVE" if real else "NOT_TESTED"),
+                "behavioral_response_effect": (
+                    "RESPONSE_BYTE_DIFFERENCE_ONLY_NOT_SEMANTIC" if response_byte_difference
+                    else "INCONCLUSIVE" if real else "NOT_TESTED"),
+                "semantic_effect": "NOT_TESTED",
                 "paired_request_AA_equal": same_a, "paired_request_BB_equal": same_b,
                 "recurrence_changes_request": changed,
                 "paired_response_AA_equal": response_stable_a if real else None,
@@ -151,7 +157,11 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     result = execute(args.private_root.resolve(), backend_config=args.backend_config)
     print(canonical(result))
-    return 0 if result["status"] == "PASS" else 2
+    # A successful byte comparison is a valid probe execution, not a
+    # successful semantic qualification. Keep those two facts separate.
+    return 0 if result["status"] in (
+        "PASS", "BYTE_COMPARISON_PASS_SEMANTIC_UNVERIFIED"
+    ) else 2
 
 
 if __name__ == "__main__":

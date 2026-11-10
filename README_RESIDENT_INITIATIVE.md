@@ -48,6 +48,18 @@ its next bounded checkpoint. `cancel` additionally writes a permanent generation
 tombstone and requests durable Pre-Active run cancellation. Blocking inference
 is fenced after return; it is not falsely described as immediately aborted.
 
+`status` reports the **persisted trial owner**, not whether a worker process is
+running. Its legacy `state=ACTIVE` means the generation has not been tombstoned
+or expired by a subsequent runtime checkpoint. A finite `run` may print
+`FINITE_BUDGET_COMPLETE` and `RESIDENT_STOPPED` and exit while the persisted
+owner still says `ACTIVE` and the schedule's enabled flag remains set. The
+additive `state_subject`, `worker_liveness`, and `schedule_flag_subject` fields
+make that separation explicit. `observation_budget_remaining=0` reports only
+the observation cap, not that a resident worker or service is alive. Process
+liveness requires a separate host process/lease check; neither the database nor
+this CLI status attests it. Opening `status` does not renew process liveness,
+mark an expired owner terminal, or restart a worker.
+
 ## Persistence and failure behavior
 
 One SQLite file holds the existing Pre-Active queue, scheduler, leases and run
