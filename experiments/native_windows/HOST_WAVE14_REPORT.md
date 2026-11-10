@@ -57,6 +57,16 @@ not authority to install there.
 - **WINDOWS_POWERSHELL_PARSE:** Rollback script staged at
   `D:\VERA\experiments\obsession-native-stop-custodian-stage-20261109-f5aeb781\wave14-review-scripts\NativeStop.Rollback.Wave14.HOLD.ps1`;
   parsed with zero errors. No `-Execute` invocation or SCM change.
+- **REAL_WINDOWS_IN_MEMORY_ACL_TEST:** Lappy compiled the Wave 14 C# into
+  a temporary stage library and invoked the private strict ACL validator
+  against in-memory DirectorySecurity objects. Exactly trusted SYSTEM and
+  Administrators FullControl **ALLOW**; untrusted specific FullControl,
+  untrusted read, extra deny, unprotected inheritance, and SYSTEM missing
+  FullControl all **DENIED**. Exact marker
+  `ACL_STAGE_RESULT=PASS;SOURCE_ONLY=true;REAL_TOKEN_EFFECTIVE_ACL=UNVERIFIED`,
+  process exit 0. Repro harness:
+  `host_tests/Test-StrictCustodyAcl.Wave14.ps1`, source SHA-256
+  `d0ae5860312efa9b1d42b97c2afbecdd816d052753f1a21d4d5644177bd151e0`.
 - **PYTHON_MOCK_TEST:** Patched native client **25/25 PASS**; existing
   Wave 12 runtime/source suite **28/28 PASS** separately; new combined
   C#/rollback source-contract **3/3 PASS**. Mock counts are not independent
