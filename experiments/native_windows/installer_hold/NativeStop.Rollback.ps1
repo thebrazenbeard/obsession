@@ -13,6 +13,7 @@ $Exe = Join-Path $Root 'ObsessionStopCustodian.exe'
 $Sha = 'ddd4622988161de40d4de9a1ce6829b302baa6a9c76ff0de8ac9af96c88735b1'
 $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\' + $Service
 $TrustedSids = @('S-1-5-18','S-1-5-32-544')
+$ReleaseHold = 'HOLD_ROLLBACK_REQUIRES_INDEPENDENT_STOP_AUTHORITY'
 
 function Assert-ProtectedCustody([string]$Path) {
     $acl = Get-Acl -LiteralPath $Path
@@ -81,6 +82,11 @@ if (-not $Execute) {
     Write-Output 'WOULD unregister SCM registration only; custody directory, STOP/grant journals, resident SID, binary and output untouched'
     return
 }
+
+# A local Administrator token by itself cannot release a separately governed
+# durable STOP authority. Keep unregistering unreachable until the external
+# monotonic witness and exact owner-approved rollback protocol are qualified.
+throw $ReleaseHold
 
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)

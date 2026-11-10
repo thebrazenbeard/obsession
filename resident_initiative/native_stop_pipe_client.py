@@ -179,6 +179,14 @@ class NativeNamedPipeChannel:
     whereas the native C# service uses BYTE mode and its own 4-byte frame.
     """
 
+    # If a Win32 CancelIoEx request never settles, releasing either the
+    # OVERLAPPED object (which owns its I/O buffer) or the HANDLE is unsafe.
+    # Keep both process-owned and deny later channels. This is an integrity
+    # quarantine, not proof that the kernel has cancelled the operation.
+    _fatal_io = False
+    _unsettled_io = []
+    _CANCEL_SETTLE_MS = 1000
+
     def __init__(self, pipe, *, timeout=3.0):
         if pipe != PUBLISH_PIPE or not 0 < timeout <= 10:
             raise ValueError("unexpected pipe or timeout")
@@ -189,8 +197,14 @@ class NativeNamedPipeChannel:
         self.deadline = None
 
     def __enter__(self):
+        if type(self)._fatal_io:
+            raise NativeStopDenied("CUSTODIAN_UNSETTLED_IO_HOLD")
         import _winapi  # only exists on Windows; deliberate fail-close on Linux
         self.api = _winapi
+        # Open/SCM attestation consumes the same budget as subsequent I/O.
+        # SCM calls are synchronous and may themselves overrun this limit;
+        # refuse publication in that case once they return.
+        self.deadline = time.monotonic() + self.timeout
         self.api.WaitNamedPipe(self.pipe, int(self.timeout * 1000))
         self.handle = self.api.CreateFile(
             self.pipe, self.api.GENERIC_READ | self.api.GENERIC_WRITE,
@@ -199,11 +213,12 @@ class NativeNamedPipeChannel:
         try:
             # Attest before sending any command or accepting any receipt.
             _attest_windows_pipe_server(self.handle)
+            if time.monotonic() >= self.deadline:
+                raise TimeoutError("native pipe attestation deadline")
         except BaseException:
             self.api.CloseHandle(self.handle)
             self.handle = None
             raise
-        self.deadline = time.monotonic() + self.timeout
         # No SetNamedPipeHandleState(..., PIPE_READMODE_MESSAGE): native C#
         # server deliberately uses byte mode.
         return self
@@ -228,17 +243,40 @@ class NativeNamedPipeChannel:
                 # CancelIoEx requests cancellation; it does not certify that
                 # the kernel has stopped using the overlapped I/O buffer.
                 # CPython's _winapi.Overlapped.cancel() clears `pending`, so
-                # discarding this object before a blocking result drain may
-                # prematurely release its read/write buffer. Match the drain
-                # convention in CPython multiprocessing.connection.
+                # discarding this object before completion could release its
+                # live read/write buffer. A blocking result drain, however,
+                # can wait forever if cancellation never settles. Bound the
+                # settle wait, quarantine the handle and buffer if unsignaled,
+                # and poison the client process against further PUBLISH calls.
                 try:
                     overlapped.cancel()
-                except OSError:
+                except Exception:
                     pass
                 try:
-                    overlapped.GetOverlappedResult(True)
-                except OSError:
-                    pass
+                    settled = self.api.WaitForMultipleObjects(
+                        [overlapped.event], False, self._CANCEL_SETTLE_MS)
+                except Exception:
+                    settled = None
+                if settled == self.api.WAIT_OBJECT_0:
+                    try:
+                        # Once the event is signaled, a nonblocking query is
+                        # sufficient to observe completion, including ABORTED.
+                        _, finish_error = overlapped.GetOverlappedResult(False)
+                        if finish_error == 996:  # ERROR_IO_INCOMPLETE
+                            settled = None
+                    except OSError as exc:
+                        if getattr(exc, "winerror", None) == 996:
+                            settled = None
+                    except Exception:
+                        settled = None
+                if settled != self.api.WAIT_OBJECT_0:
+                    # Never close the handle or release OVERLAPPED's backing
+                    # buffers while Win32 may still refer to them. Deliberate
+                    # bounded resource retention ends at process exit.
+                    type(self)._unsettled_io.append((self.handle, overlapped))
+                    self.handle = None
+                    type(self)._fatal_io = True
+                    raise NativeStopDenied("CUSTODIAN_UNSETTLED_IO_HOLD")
                 raise
         count, error = overlapped.GetOverlappedResult(True)
         if error:
@@ -363,4 +401,3 @@ class NativeStopPublishClient:
         return {"path": str(PureWindowsPath(self.output_root) / (artifact_id + ".json")),
                 "receipt": answer, "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY",
                 "contact_authorized": False, "delivery_verified": False}
-

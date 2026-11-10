@@ -249,7 +249,7 @@ class NativePipeTests(unittest.TestCase):
                 events.append("cancel")
 
             def GetOverlappedResult(self, wait):
-                assert wait is True
+                assert wait is False
                 events.append("drain")
                 return 0, 995  # ERROR_OPERATION_ABORTED
 
@@ -257,9 +257,13 @@ class NativePipeTests(unittest.TestCase):
             ERROR_IO_PENDING = 997
             WAIT_OBJECT_0 = 0
 
+            def __init__(self):
+                self.waits = 0
+
             def WaitForMultipleObjects(self, handles, wait_all, timeout):
+                self.waits += 1
                 events.append("wait_timeout")
-                return 258  # WAIT_TIMEOUT
+                return 258 if self.waits == 1 else self.WAIT_OBJECT_0
 
         operation = PendingOperation()
         channel = NativeNamedPipeChannel(PUBLISH_PIPE)
@@ -267,7 +271,7 @@ class NativePipeTests(unittest.TestCase):
         channel.deadline = time.monotonic() + 1.0
         with self.assertRaises(TimeoutError):
             channel._finish(operation, channel.api.ERROR_IO_PENDING)
-        self.assertEqual(events, ["wait_timeout", "cancel", "drain"])
+        self.assertEqual(events, ["wait_timeout", "cancel", "wait_timeout", "drain"])
 
     def test_wait_failure_cancels_and_drains_pending_operation(self):
         events = []
@@ -279,7 +283,7 @@ class NativePipeTests(unittest.TestCase):
                 events.append("cancel")
 
             def GetOverlappedResult(self, wait):
-                assert wait is True
+                assert wait is False
                 events.append("drain")
                 return 0, 995
 
@@ -287,8 +291,14 @@ class NativePipeTests(unittest.TestCase):
             ERROR_IO_PENDING = 997
             WAIT_OBJECT_0 = 0
 
+            def __init__(self):
+                self.waits = 0
+
             def WaitForMultipleObjects(self, handles, wait_all, timeout):
-                raise OSError("wait interrupted")
+                self.waits += 1
+                if self.waits == 1:
+                    raise OSError("wait interrupted")
+                return self.WAIT_OBJECT_0
 
         operation = PendingOperation()
         channel = NativeNamedPipeChannel(PUBLISH_PIPE)
@@ -297,6 +307,125 @@ class NativePipeTests(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "wait interrupted"):
             channel._finish(operation, channel.api.ERROR_IO_PENDING)
         self.assertEqual(events, ["cancel", "drain"])
+
+    def test_unsettled_cancel_never_blocks_and_quarantines_kernel_buffer(self):
+        """A peer can leave a cancelled operation unsignaled; fail closed."""
+        events = []
+
+        class StuckOperation:
+            event = 123
+
+            def cancel(self):
+                events.append("cancel")
+
+            def GetOverlappedResult(self, wait):
+                if wait:
+                    raise AssertionError("unbounded blocking result drain")
+                events.append("get_nonblocking")
+                return 0, 995
+
+        class StuckApi:
+            ERROR_IO_PENDING = 997
+            WAIT_OBJECT_0 = 0
+
+            def WaitForMultipleObjects(self, handles, wait_all, timeout):
+                events.append(("wait", timeout))
+                return 258
+
+            def CloseHandle(self, handle):
+                events.append(("close", handle))
+
+        operation = StuckOperation()
+        channel = NativeNamedPipeChannel(PUBLISH_PIPE)
+        channel.api = StuckApi()
+        channel.handle = "unfinished-handle"
+        channel.deadline = time.monotonic() + 0.1
+        try:
+            with self.assertRaisesRegex(NativeStopDenied, "CUSTODIAN_UNSETTLED_IO_HOLD"):
+                channel._finish(operation, channel.api.ERROR_IO_PENDING)
+            channel.__exit__()
+            self.assertNotIn(("close", "unfinished-handle"), events)
+            self.assertFalse(any(event == "get_nonblocking" for event in events))
+            self.assertIsNone(channel.handle)
+            self.assertTrue(NativeNamedPipeChannel._fatal_io)
+            self.assertTrue(any(item[1] is operation for item in NativeNamedPipeChannel._unsettled_io))
+            with self.assertRaisesRegex(NativeStopDenied, "CUSTODIAN_UNSETTLED_IO_HOLD"):
+                NativeNamedPipeChannel(PUBLISH_PIPE).__enter__()
+        finally:
+            NativeNamedPipeChannel._fatal_io = False
+            NativeNamedPipeChannel._unsettled_io.clear()
+
+    def test_settled_cancel_drains_nonblocking_and_preserves_original_timeout(self):
+        events = []
+
+        class SettledOperation:
+            event = 123
+
+            def cancel(self):
+                events.append("cancel")
+
+            def GetOverlappedResult(self, wait):
+                events.append(("result", wait))
+                if wait:
+                    raise AssertionError("unbounded blocking result drain")
+                return 0, 995
+
+        class SettledApi:
+            ERROR_IO_PENDING = 997
+            WAIT_OBJECT_0 = 0
+
+            def __init__(self):
+                self.waits = 0
+
+            def WaitForMultipleObjects(self, handles, wait_all, timeout):
+                self.waits += 1
+                return 258 if self.waits == 1 else self.WAIT_OBJECT_0
+
+        channel = NativeNamedPipeChannel(PUBLISH_PIPE)
+        channel.api = SettledApi()
+        channel.deadline = time.monotonic() + 0.1
+        with self.assertRaisesRegex(TimeoutError, "native pipe I/O deadline"):
+            channel._finish(SettledOperation(), channel.api.ERROR_IO_PENDING)
+        self.assertEqual(events, ["cancel", ("result", False)])
+        self.assertFalse(getattr(NativeNamedPipeChannel, "_fatal_io", False))
+
+    def test_signaled_but_incomplete_result_is_still_quarantined(self):
+        class IncompleteOperation:
+            event = 123
+
+            def cancel(self):
+                pass
+
+            def GetOverlappedResult(self, wait):
+                if wait:
+                    raise AssertionError("unbounded blocking result drain")
+                return 0, 996  # ERROR_IO_INCOMPLETE contradicts signaled event
+
+        class IncompleteApi:
+            ERROR_IO_PENDING = 997
+            WAIT_OBJECT_0 = 0
+
+            def __init__(self):
+                self.calls = 0
+
+            def WaitForMultipleObjects(self, handles, wait_all, timeout):
+                self.calls += 1
+                return 258 if self.calls == 1 else self.WAIT_OBJECT_0
+
+        channel = NativeNamedPipeChannel(PUBLISH_PIPE)
+        channel.api = IncompleteApi()
+        channel.handle = "incomplete-handle"
+        channel.deadline = time.monotonic() + 0.1
+        operation = IncompleteOperation()
+        try:
+            with self.assertRaisesRegex(NativeStopDenied, "CUSTODIAN_UNSETTLED_IO_HOLD"):
+                channel._finish(operation, channel.api.ERROR_IO_PENDING)
+            self.assertIsNone(channel.handle)
+            self.assertEqual(NativeNamedPipeChannel._unsettled_io[-1],
+                             ("incomplete-handle", operation))
+        finally:
+            NativeNamedPipeChannel._fatal_io = False
+            NativeNamedPipeChannel._unsettled_io.clear()
 
     def test_spoofed_published_reply_blocked_before_any_wire_data(self):
         """Peer matching the pipe name is never sufficient to trust PUBLISHED."""
@@ -323,6 +452,22 @@ class NativePipeTests(unittest.TestCase):
         self.assertEqual(len(api.writes), 2)
         ack = b"ACK|" + hashlib.sha256(("PUBLISHED|" + ARTIFACT).encode()).hexdigest().encode() + b"|V1"
         self.assertEqual(api.writes[1], frame(ack))
+        self.assertEqual(api.closed, ["fake-handle"])
+
+    def test_attestation_consumes_same_timeout_budget_as_pipe_io(self):
+        """Late SCM checks must not reset a fresh I/O clock before PUBLISH."""
+        api = FakeWinApi(b"")
+        api.WaitNamedPipe = lambda _pipe, _timeout: None
+
+        def delayed_attestation(_handle):
+            time.sleep(0.035)
+
+        with patch.dict(sys.modules, {"_winapi": api}), patch(
+            "resident_initiative.native_stop_pipe_client._attest_windows_pipe_server",
+            side_effect=delayed_attestation):
+            with self.assertRaisesRegex(TimeoutError, "native pipe .* deadline"):
+                with NativeNamedPipeChannel(PUBLISH_PIPE, timeout=0.01):
+                    pass
         self.assertEqual(api.closed, ["fake-handle"])
 
     def test_win32_peer_scm_pid_and_state_contract_mock(self):
@@ -451,4 +596,3 @@ class NativePipeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

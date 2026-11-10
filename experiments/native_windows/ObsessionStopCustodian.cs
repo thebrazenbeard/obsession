@@ -145,6 +145,7 @@ namespace Vera.ObsessionStop
                 RejectBroadAcl(acl, strict);
                 if (String.Equals(p, Path.GetDirectoryName(Root), StringComparison.OrdinalIgnoreCase)
                     || strict) RequireTrustedOwner(acl);
+                if (strict) RequireStrictCustodyAcl(acl);
             }
             string executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
             if (!string.Equals(Path.GetFullPath(executable), PathInside("ObsessionStopCustodian.exe"),
@@ -156,6 +157,7 @@ namespace Vera.ObsessionStop
                 AccessControlSections.Access | AccessControlSections.Owner);
             RejectBroadAcl(exeAcl, true);
             RequireTrustedOwner(exeAcl);
+            RequireStrictCustodyAcl(exeAcl);
             string pinnedHash = File.ReadAllText(PathInside("binary.sha256"), Encoding.ASCII).Trim();
             if (!Digest.IsMatch(pinnedHash) || Sha256Hex(File.ReadAllBytes(executable)) != pinnedHash)
                 throw new IOException("protected executable hash mismatch");
@@ -184,6 +186,48 @@ namespace Vera.ObsessionStop
             if (sid == null || !(sid.IsWellKnown(WellKnownSidType.LocalSystemSid)
                 || sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid)))
                 throw new IOException("custody path owner is not SYSTEM or Administrators");
+        }
+
+        private static void RequireStrictCustodyAcl(FileSystemSecurity security)
+        {
+            // Checking only broad SIDs is insufficient: an ACL can grant
+            // a specific untrusted user WRITE/FullControl while retaining
+            // SYSTEM ownership. Protected custody permits exactly two
+            // explicit trusted full-control ACEs and no inherited/deny ACEs.
+            if (!security.AreAccessRulesProtected)
+                throw new IOException("protected custody ACL inherits untrusted authority");
+            AuthorizationRuleCollection rules = security.GetAccessRules(
+                true, true, typeof(SecurityIdentifier));
+            if (rules.Count != 2)
+                throw new IOException("unexpected protected custody ACE count");
+            bool system = false;
+            bool administrators = false;
+            foreach (AuthorizationRule rule in rules)
+            {
+                FileSystemAccessRule access = rule as FileSystemAccessRule;
+                if (access == null || access.IsInherited
+                    || access.AccessControlType != AccessControlType.Allow
+                    || (access.FileSystemRights & FileSystemRights.FullControl)
+                       != FileSystemRights.FullControl)
+                    throw new IOException("protected custody contains nontrusted ACE");
+                SecurityIdentifier sid = access.IdentityReference as SecurityIdentifier;
+                if (sid == null)
+                    throw new IOException("unresolved protected custody principal");
+                if (sid.IsWellKnown(WellKnownSidType.LocalSystemSid))
+                {
+                    if (system) throw new IOException("duplicate SYSTEM custody ACE");
+                    system = true;
+                }
+                else if (sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid))
+                {
+                    if (administrators)
+                        throw new IOException("duplicate Administrators custody ACE");
+                    administrators = true;
+                }
+                else throw new IOException("untrusted specific protected custody principal");
+            }
+            if (!system || !administrators)
+                throw new IOException("protected custody missing trusted full-control ACE");
         }
 
         private static void RejectBroadAcl(FileSystemSecurity security, bool strict)
@@ -241,6 +285,7 @@ namespace Vera.ObsessionStop
                         AccessControlSections.Access | AccessControlSections.Owner);
                     RejectBroadAcl(acl, true);
                     RequireTrustedOwner(acl);
+                    RequireStrictCustodyAcl(acl);
                 }
 #endif
                 foreach (string row in File.ReadAllLines(stopPath, Encoding.ASCII))
@@ -995,6 +1040,8 @@ namespace Vera.ObsessionStop
             LoadState(); // fail before pipes expose any publication capability
             NamedPipeServerStream operatorPipe = null;
             NamedPipeServerStream publishPipe = null;
+            bool operatorStarted = false;
+            bool publishStarted = false;
             try
             {
                 // Reserve BOTH names synchronously before SCM reports RUNNING.
@@ -1009,13 +1056,21 @@ namespace Vera.ObsessionStop
                 operatorThread.IsBackground = true;
                 publishThread.IsBackground = true;
                 operatorThread.Start();
+                operatorStarted = true;
                 publishThread.Start();
+                publishStarted = true;
             }
             catch
             {
                 lock (gate) { healthy = false; running = false; }
-                if (operatorPipe != null) operatorPipe.Dispose();
-                if (publishPipe != null) publishPipe.Dispose();
+                // Started workers own their pipe handles and pending APM wait.
+                // Wait for their cancellation/EndWait path before any disposal.
+                bool operatorDrained = !operatorStarted || operatorThread.Join(10000);
+                bool publishDrained = !publishStarted || publishThread.Join(10000);
+                if (!operatorDrained || !publishDrained)
+                    Environment.FailFast("STOP custodian startup worker drain unverified");
+                if (!operatorStarted && operatorPipe != null) operatorPipe.Dispose();
+                if (!publishStarted && publishPipe != null) publishPipe.Dispose();
                 throw;
             }
         }
