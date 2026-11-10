@@ -39,7 +39,37 @@ function Assert-ProtectedCustody([string]$Path) {
     }
 }
 
+function Assert-SafeCustodyParent([string]$Path) {
+    # A protected child DACL cannot compensate for DELETE_CHILD/structural
+    # authority held through its immediate parent. Never treat a trusted
+    # owner alone as proof that the parent cannot be replaced by another SID.
+    # InheritOnly ACEs do not apply to the parent itself; child inheritance is
+    # separately disabled by its exact protected-custody policy.
+    $acl = Get-Acl -LiteralPath $Path
+    $owner = ([System.Security.Principal.NTAccount]$acl.Owner).Translate(
+        [System.Security.Principal.SecurityIdentifier]).Value
+    if ($TrustedSids -cnotcontains $owner) { throw "Custody parent owner drift: $Path [$owner]" }
+    $danger = [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+        [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+        [System.Security.AccessControl.FileSystemRights]::Delete -bor
+        [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes
+    foreach ($rule in $acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne 'Allow') { continue }
+        if (($rule.PropagationFlags -band
+             [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+        $sid = $rule.IdentityReference.Value
+        if ($TrustedSids -cnotcontains $sid -and (($rule.FileSystemRights -band $danger) -ne 0)) {
+            throw "Custody parent structural ACE drift: $Path [$sid]"
+        }
+    }
+}
+
 if ($env:OS -ne 'Windows_NT') { throw 'Windows only' }
+Assert-SafeCustodyParent 'C:\Program Files\VERA'
 if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
     throw 'Custody directory absent; not an owned rollback target'
 }

@@ -145,6 +145,8 @@ namespace Vera.ObsessionStop
                 RejectBroadAcl(acl, strict);
                 if (String.Equals(p, Path.GetDirectoryName(Root), StringComparison.OrdinalIgnoreCase)
                     || strict) RequireTrustedOwner(acl);
+                if (String.Equals(p, Path.GetDirectoryName(Root), StringComparison.OrdinalIgnoreCase))
+                    RequireNoUntrustedStructuralRights(acl);
                 if (strict) RequireStrictCustodyAcl(acl);
             }
             string executable = System.Reflection.Assembly.GetExecutingAssembly().Location;
@@ -230,6 +232,43 @@ namespace Vera.ObsessionStop
                 throw new IOException("protected custody missing trusted full-control ACE");
         }
 
+        private static void RequireNoUntrustedStructuralRights(FileSystemSecurity security)
+        {
+            // A specific untrusted SID with DELETE_CHILD/CreateFiles on the
+            // immediate custody parent can replace protected children even
+            // when the protected child DACL is exact SYSTEM/Administrators.
+            // C:\ and Program Files retain their separate OS ancestor policy;
+            // this guard applies to C:\Program Files\VERA itself.
+            // SYSTEM/Administrators are the only released principals.
+            // TrustedInstaller or any other additional structural authority
+            // is a host-qualification HOLD, not an implicit policy exception.
+            AuthorizationRuleCollection rules = security.GetAccessRules(
+                true, true, typeof(SecurityIdentifier));
+            foreach (AuthorizationRule rule in rules)
+            {
+                FileSystemAccessRule access = rule as FileSystemAccessRule;
+                if (access == null || access.AccessControlType != AccessControlType.Allow)
+                    continue;
+                // InheritOnly grants no DELETE_CHILD/CreateFiles on this
+                // immediate parent. The custody child disables inheritance.
+                if ((access.PropagationFlags & PropagationFlags.InheritOnly) != 0)
+                    continue;
+                SecurityIdentifier sid = access.IdentityReference as SecurityIdentifier;
+                if (sid == null)
+                    throw new IOException("unresolved custody parent ACL principal");
+                if (sid.IsWellKnown(WellKnownSidType.LocalSystemSid)
+                    || sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid))
+                    continue;
+                FileSystemRights structural = FileSystemRights.DeleteSubdirectoriesAndFiles
+                    | FileSystemRights.Delete | FileSystemRights.WriteData
+                    | FileSystemRights.AppendData | FileSystemRights.WriteAttributes
+                    | FileSystemRights.WriteExtendedAttributes
+                    | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
+                if ((access.FileSystemRights & structural) != 0)
+                    throw new IOException("untrusted specific ancestor structural rights");
+            }
+        }
+
         private static void RejectBroadAcl(FileSystemSecurity security, bool strict)
         {
             AuthorizationRuleCollection rules = security.GetAccessRules(true, true,
@@ -288,14 +327,14 @@ namespace Vera.ObsessionStop
                     RequireStrictCustodyAcl(acl);
                 }
 #endif
-                foreach (string row in File.ReadAllLines(stopPath, Encoding.ASCII))
+                foreach (string row in ReadCompleteJournalRows(stopPath))
                 {
                     string[] p = row.Split('|');
                     if (p.Length != 3 || p[0] != "STOP" || !Generation.IsMatch(p[1])
                         || !IsTicks(p[2])) throw new IOException("corrupted STOP journal");
                     revoked.Add(p[1]);
                 }
-                foreach (string row in File.ReadAllLines(grantPath, Encoding.ASCII))
+                foreach (string row in ReadCompleteJournalRows(grantPath))
                 {
                     string[] p = row.Split('|');
                     if (p.Length != 5 || p[0] != "GRANT" || !Generation.IsMatch(p[1])
@@ -318,6 +357,33 @@ namespace Vera.ObsessionStop
         {
             long v;
             return long.TryParse(s, out v) && v > DateTime.MinValue.Ticks && v <= DateTime.MaxValue.Ticks;
+        }
+
+        private static string[] ReadCompleteJournalRows(string path)
+        {
+            // ReadAllLines accepts an unterminated final line, but a crash can
+            // leave a syntactically valid GRANT record without its final LF.
+            // Never promote a partially appended grant during restart replay.
+            byte[] raw = File.ReadAllBytes(path);
+            if (raw.Length == 0) return new string[0];
+            if (raw[raw.Length - 1] != (byte)'\n')
+                throw new IOException("incomplete protected journal final record");
+            for (int i = 0; i < raw.Length; i++)
+            {
+                if (raw[i] > 127 || (raw[i] < 32 && raw[i] != (byte)'\n'))
+                    throw new IOException("noncanonical protected journal bytes");
+            }
+            string[] rows = Encoding.ASCII.GetString(raw).Split('\n');
+            // Exactly one terminal LF is accepted. Another LF yields an
+            // empty record which is treated as corruption, never ignored.
+            string[] result = new string[rows.Length - 1];
+            for (int i = 0; i < result.Length; i++)
+            {
+                if (rows[i].Length == 0)
+                    throw new IOException("empty protected journal record");
+                result[i] = rows[i];
+            }
+            return result;
         }
 
         private static void DurableAppend(string file, string row)

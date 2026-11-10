@@ -61,6 +61,32 @@ function Assert-NoBroadStructuralRights([string]$Path, [bool]$Strict) {
     }
 }
 
+function Assert-SafeCustodyParent([string]$Path) {
+    # The dedicated VERA parent must not be structurally mutable by a
+    # specific untrusted SID. Checking broad groups alone misses grants such
+    # as an explicit user DELETE_CHILD or CreateDirectories on this parent.
+    # Keep this rule separate from root/Program Files: those OS ancestors have
+    # broader, legitimate ACLs. An INHERIT_ONLY ACE is not effective on this
+    # parent; the protected child is required to disable inheritance.
+    # Do not silently expand trusted structural principals (e.g. to
+    # TrustedInstaller). An existing such effective ACE is a deliberate HOLD
+    # pending explicit owner authority and a qualified host ACL design.
+    $acl = Get-Acl -LiteralPath $Path
+    $danger = $Dangerous -bor [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes
+    foreach ($rule in $acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne 'Allow') { continue }
+        if (($rule.PropagationFlags -band
+             [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+        $sid = $rule.IdentityReference.Value
+        if ($TrustedSids -cnotcontains $sid -and
+            (($rule.FileSystemRights -band $danger) -ne 0)) {
+            throw "Untrusted specific principal has structural custody-parent rights: $Path [$sid]"
+        }
+    }
+}
+
 function Assert-StrictCustodyAcl([string]$Path) {
     Assert-NotLink $Path
     Assert-OwnerTrusted $Path
@@ -151,6 +177,7 @@ foreach ($ancestor in @('C:\','C:\Program Files','C:\Program Files\VERA')) {
     Assert-NoBroadStructuralRights $ancestor $false
 }
 Assert-OwnerTrusted 'C:\Program Files\VERA'
+Assert-SafeCustodyParent 'C:\Program Files\VERA'
 
 if (Test-Path -LiteralPath $Target) { throw 'Target exists; refuse overwrite, repair, or journal reinitialization' }
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {

@@ -32,6 +32,34 @@ if ($Role -eq 'Resident') {
 # registration. A real non-admin resident *cannot*: that inability is exactly
 # what the effective-denial phase needs to verify. Never run this phase with
 # the resident token or interpret its failure to read custody as missing state.
+function Assert-SafeCustodyParent([string]$Path) {
+    # The immediate VERA parent is a structural authority boundary. Broad-SID
+    # checks alone miss explicit untrusted users with DELETE_CHILD, CreateFiles,
+    # or CreateDirectories. InheritOnly grants do not apply to this directory;
+    # the STOP child's own DACL must separately disable inheritance.
+    $acl = Get-Acl -LiteralPath $Path
+    $owner = ([System.Security.Principal.NTAccount]$acl.Owner).Translate(
+        [System.Security.Principal.SecurityIdentifier]).Value
+    if ($TrustedSids -cnotcontains $owner) { throw "UNTRUSTED_CUSTODY_PARENT_OWNER: $Path [$owner]" }
+    $danger = [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+        [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+        [System.Security.AccessControl.FileSystemRights]::Delete -bor
+        [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes
+    foreach ($rule in $acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne 'Allow') { continue }
+        if (($rule.PropagationFlags -band
+             [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
+        $sid = $rule.IdentityReference.Value
+        if ($TrustedSids -cnotcontains $sid -and (($rule.FileSystemRights -band $danger) -ne 0)) {
+            throw "UNTRUSTED_CUSTODY_PARENT_STRUCTURAL_ACE: $Path [$sid]"
+        }
+    }
+}
+
 if ($Role -eq 'Host') {
 foreach ($path in @('C:\','C:\Program Files','C:\Program Files\VERA', $Root,
     (Join-Path $Root 'output'),$Executable,(Join-Path $Root 'resident.sid'),
@@ -43,6 +71,8 @@ foreach ($path in @('C:\','C:\Program Files','C:\Program Files\VERA', $Root,
         throw "REPARSE_PATH: $path"
     }
 }
+
+Assert-SafeCustodyParent 'C:\Program Files\VERA'
 
 foreach ($path in @($Root,(Join-Path $Root 'output'),$Executable,
     (Join-Path $Root 'resident.sid'),(Join-Path $Root 'binary.sha256'),
