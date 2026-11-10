@@ -6,6 +6,7 @@ import unittest
 
 from resident_initiative.runtime import Runtime, SyntheticConfig, canonical
 from pre_active.engine import ModelResponse, RetryableModelError, ToolCall
+from stop_fixture import SyntheticStopAuthority
 
 
 class Clock:
@@ -34,6 +35,8 @@ class RuntimeTests(unittest.TestCase):
         self.provider = Provider()
         Runtime.initialize(self.db, SyntheticConfig(expires_at=500, max_events=2, interval_seconds=30), now=100)
         self.runtime = Runtime(self.db, self.provider, clock=self.clock)
+        self.stop_authority = SyntheticStopAuthority()
+        self.runtime.stop_authority = self.stop_authority
     def tearDown(self):
         self.runtime.close()
         self.temp.cleanup()
@@ -233,3 +236,4 @@ class RuntimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

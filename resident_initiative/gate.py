@@ -11,10 +11,27 @@ import os
 from pathlib import Path
 import tempfile
 import uuid
+from functools import wraps
 
 from .runtime import CommitDenial, Runtime, canonical, digest, finite
 from .deps import PROVENANCE
+from .stop_authority import require_stop_admission
 from pre_active.engine import ModelResponse
+
+
+def _requires_independent_stop(method):
+    """Hold STOP serialization until the local publication returns.
+
+    This deliberately rejects old CLI callers without an approved, protected
+    STOP provider. A cached allow decision is not sufficient.
+    """
+    @wraps(method)
+    def wrapped(self, *args, now=None, **kwargs):
+        stamp = self.runtime.clock() if now is None else now
+        with require_stop_admission(getattr(self.runtime, "stop_authority", None),
+                                    generation=self.runtime.generation, now=stamp):
+            return method(self, *args, now=stamp, **kwargs)
+    return wrapped
 
 
 class LocalHandoffGate:
@@ -64,6 +81,7 @@ class LocalHandoffGate:
                                  {"reason": "PROPOSAL_INTEGRITY_FAILURE"}, now)
             raise CommitDenial("stored proposal failed fresh integrity verification") from exc
 
+    @_requires_independent_stop
     def authorize(self, proposal_id, directory, *, expires_at, now=None):
         """Explicit owner CLI/API action. It grants only local file export."""
         now = self.runtime.clock() if now is None else now
@@ -86,6 +104,7 @@ class LocalHandoffGate:
                 "proposal_digest": row["proposal_digest"], "generation": self.runtime.generation,
                 "directory": directory, "expires_at": expires_at, "contact_authorized": False}
 
+    @_requires_independent_stop
     def export(self, proposal_id, grant_path, directory, *, now=None):
         now = self.runtime.clock() if now is None else now
         grant_file = json.loads(Path(grant_path).read_text(encoding="utf-8"))
@@ -135,3 +154,4 @@ class LocalHandoffGate:
             self.runtime._record(proposal_id, "LOCAL_HANDOFF_EXPORTED", {"path_digest": digest(str(target)), "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY"}, now)
             return {"path": str(target), "sha256": hashlib.sha256(payload).hexdigest(),
                     "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY", "contact_authorized": False, "delivery_verified": False}
+
