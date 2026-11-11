@@ -3,6 +3,7 @@
 All files, clocks, grants, identities and STOP authorities are disposable and
 synthetic. This does NOT establish protected Windows custody or phone delivery.
 """
+from contextlib import closing
 import json
 from pathlib import Path
 import shutil
@@ -66,7 +67,7 @@ class StopAdmissionTests(unittest.TestCase):
     def test_snapshot_restore_cannot_erase_external_stop(self):
         proposal, file, target = self.ready_grant()
         snapshot = self.root / "prestop.sqlite3"
-        with sqlite3.connect(snapshot) as saved:
+        with closing(sqlite3.connect(snapshot)) as saved:
             self.runtime.store.connection.backup(saved)
         self.runtime.cancel(now=100)
         self.runtime.close()
@@ -106,7 +107,7 @@ class StopAdmissionTests(unittest.TestCase):
         """Deliberately exposes why the synthetic witness is NOT host custody."""
         proposal, file, target = self.ready_grant()
         snapshot = self.root / "prestop-new-witness.sqlite3"
-        with sqlite3.connect(snapshot) as saved:
+        with closing(sqlite3.connect(snapshot)) as saved:
             self.runtime.store.connection.backup(saved)
         self.runtime.cancel(now=100)
         self.runtime.close()
@@ -185,10 +186,52 @@ class StopAdmissionTests(unittest.TestCase):
         self.assertFalse(t_stop.is_alive())
         self.assertEqual(failures, [])
         self.assertTrue(stopped.is_set())
-        self.assertEqual(len(list(target.glob("*.json"))), 1)
-        with self.assertRaises(StopAuthorityUnavailable):
-            self.runtime.export(proposal["proposal_id"], file, self.root / "after_stop")
-        self.assertFalse((self.root / "after_stop").exists())
+        artifacts = list(target.glob("*.json"))
+        self.assertEqual(len(artifacts), 1)
+        before = artifacts[0].read_bytes()
+        with self.assertRaisesRegex(StopAuthorityUnavailable, "TEST_CUSTODIAN_STOPPED"):
+            self.runtime.export(proposal["proposal_id"], file, target)
+        self.assertEqual(list(target.glob("*.json")), artifacts)
+        self.assertEqual(artifacts[0].read_bytes(), before)
+
+    def test_stop_wins_after_resident_buffers_payload_before_custodian_lock(self):
+        proposal, file, target = self.ready_grant()
+        buffered = threading.Event()
+        release = threading.Event()
+        results = []
+        original = self.witness.publish_local
+
+        def pause_before_custodian_lock(**request):
+            self.assertIsInstance(request["payload"], bytes)
+            buffered.set()
+            if not release.wait(timeout=3):
+                raise TimeoutError("test did not release buffered publication")
+            return original(**request)
+
+        def exporter():
+            runtime = Runtime(self.db, _Provider(), clock=self.clock,
+                              stop_authority=self.witness)
+            try:
+                runtime.export(proposal["proposal_id"], file, target)
+            except Exception as exc:
+                results.append(exc)
+            finally:
+                runtime.close()
+
+        with mock.patch.object(self.witness, "publish_local", side_effect=pause_before_custodian_lock):
+            worker = threading.Thread(target=exporter)
+            worker.start()
+            try:
+                self.assertTrue(buffered.wait(timeout=3), "publication was never buffered")
+                self.witness.revoke(generation=self.runtime.generation, now=100)
+            finally:
+                release.set()
+                worker.join(timeout=4)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], StopAuthorityUnavailable)
+        self.assertEqual(str(results[0]), "TEST_CUSTODIAN_STOPPED")
+        self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":

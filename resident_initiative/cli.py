@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-from pathlib import Path
 import signal
 import sys
 import threading
@@ -25,21 +23,31 @@ def main(argv=None):
     run.add_argument("--backend-config", required=True)
     run.add_argument("--poll-seconds", type=float, default=0.5)
     run.add_argument("--max-seconds", type=float, default=600)
-    for command in ("status", "cancel"):
-        child = sub.add_parser(command)
+    for command, description in (
+        ("status", "Read resident state"),
+        ("cancel", "Record local cancellation; protected STOP requires the owner custodian"),
+    ):
+        child = sub.add_parser(command, help=description)
         child.add_argument("--db", required=True)
-    grant = sub.add_parser("grant-local")
+    grant = sub.add_parser("grant-local", help="Held until a protected publisher is integrated")
     grant.add_argument("--db", required=True)
     grant.add_argument("--proposal", required=True)
     grant.add_argument("--directory", required=True)
     grant.add_argument("--grant-file", required=True)
     grant.add_argument("--ttl-seconds", type=float, default=60)
-    export = sub.add_parser("export")
+    export = sub.add_parser("export", help="Held until a protected publisher is integrated")
     export.add_argument("--db", required=True)
     export.add_argument("--proposal", required=True)
     export.add_argument("--grant-file", required=True)
     export.add_argument("--directory", required=True)
     args = parser.parse_args(argv)
+    if args.command in {"grant-local", "export"}:
+        # This CLI has no protected publisher configuration. Reject at entry
+        # before opening writable SQLite state or reading a legacy grant file.
+        print(canonical({"state": "PUBLICATION_HELD", "command": args.command,
+                         "reason": "PROTECTED_HOST_PUBLISHER_UNAVAILABLE",
+                         "contact_authorized": False}), file=sys.stderr)
+        return 1
     if args.command == "init":
         now = time.time()
         config = SyntheticConfig(expires_at=now + args.ttl_seconds,
@@ -60,17 +68,6 @@ def main(argv=None):
             print(canonical(runtime.status()))
         elif args.command == "cancel":
             print(canonical(runtime.cancel()))
-        elif args.command == "grant-local":
-            grant = runtime.grant_local(args.proposal, args.directory,
-                                        expires_at=time.time() + args.ttl_seconds)
-            path = Path(args.grant_file).resolve()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("x", encoding="utf-8") as output:
-                output.write(canonical(grant) + "\n")
-            print(canonical({"state": "LOCAL_GRANT_CREATED", "grant_file": str(path),
-                             "scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY", "contact_authorized": False}))
-        elif args.command == "export":
-            print(canonical(runtime.export(args.proposal, args.grant_file, args.directory)))
         elif args.command == "run":
             stopping = threading.Event()
             def stop(signum, frame):

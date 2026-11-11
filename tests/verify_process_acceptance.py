@@ -1,6 +1,6 @@
 """Independent process acceptance with synthetic providers, never phone delivery.
 
-The production CLI initializes, reads, cancels and exports trial state. Separate
+The CLI initializes, reads and cancels trial state and holds publication. Separate
 Python workers exercise the public Runtime API with explicitly unverified
 provider fixtures; no HTTP or model inference is involved in this verifier.
 """
@@ -97,11 +97,12 @@ def verify(args):
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(ROOT) + os.pathsep + environment.get("PYTHONPATH", "")
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    child_options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
     def call(argv, *, expected=0, timeout=18):
         command = [sys.executable, "-B", *map(str, argv)]
         result = subprocess.run(command, cwd=ROOT, env=environment, capture_output=True,
-                                text=True, timeout=timeout)
+                                text=True, timeout=timeout, **child_options)
         commands.append({"argv": command, "exit_code": result.returncode})
         if result.returncode != expected:
             raise AssertionError(encoded({"expected_exit": expected, "exit": result.returncode,
@@ -152,39 +153,39 @@ def verify(args):
         forged.write_text(encoded({"scope": "LOCAL_SYNTHETIC_HANDOFF_ONLY", "grant_id": "unissued"}), encoding="utf-8")
         rejected = cli("export", "--db", timer_db, "--proposal", proposal_id,
                        "--grant-file", forged, "--directory", outbox, expected=1)
-        denied_status = cli("status", "--db", timer_db)
-        check("unissued_grant_rejected_before_artifact",
-              not outbox.exists() and any(x["disposition"] == "REJECTED_LOCAL_HANDOFF"
-                                         for x in denied_status["receipts"]))
+        check("cli_export_with_unissued_grant_is_held_without_publisher",
+              not outbox.exists() and json.loads(rejected.stderr) == {
+                  "state": "PUBLICATION_HELD", "command": "export",
+                  "reason": "PROTECTED_HOST_PUBLISHER_UNAVAILABLE",
+                  "contact_authorized": False})
         grant_file = base / "issued.json"
-        cli("grant-local", "--db", timer_db, "--proposal", proposal_id,
-            "--grant-file", grant_file, "--directory", outbox, "--ttl-seconds", 30)
-        exported = cli("export", "--db", timer_db, "--proposal", proposal_id,
-                       "--grant-file", grant_file, "--directory", outbox)
-        artifact = Path(exported["path"])
-        body = json.loads(artifact.read_text(encoding="utf-8"))
-        check("explicit_host_grant_exports_local_synthetic_only",
-              body["scope"] == "LOCAL_SYNTHETIC_HANDOFF_ONLY"
-              and body["contact_authorized"] is False and body["delivery_verified"] is False
-              and body["proposal"] == proposal
-              and hashlib.sha256(artifact.read_bytes()).hexdigest() == exported["sha256"])
-        repeated = cli("export", "--db", timer_db, "--proposal", proposal_id,
-                       "--grant-file", grant_file, "--directory", outbox)
-        check("handoff_replay_reuses_exact_artifact",
-              repeated == exported and len(list(outbox.glob("*.json"))) == 1)
-        wrong = base / "wrong-directory"
-        cli("export", "--db", timer_db, "--proposal", proposal_id,
-            "--grant-file", grant_file, "--directory", wrong, expected=1)
-        check("grant_cannot_widen_export_directory", not wrong.exists())
+        denied_grant = cli("grant-local", "--db", timer_db, "--proposal", proposal_id,
+                           "--grant-file", grant_file, "--directory", outbox, expected=1)
+        check("missing_publisher_cannot_issue_local_grant",
+              json.loads(denied_grant.stderr) == {
+                  "state": "PUBLICATION_HELD", "command": "grant-local",
+                  "reason": "PROTECTED_HOST_PUBLISHER_UNAVAILABLE",
+                  "contact_authorized": False}
+              and not grant_file.exists() and not outbox.exists())
+        missing_db = base / "missing.db"
+        denied_missing = cli("export", "--db", missing_db, "--proposal", proposal_id,
+                             "--grant-file", grant_file, "--directory", outbox, expected=1)
+        check("publication_hold_precedes_opening_worker_inputs",
+              json.loads(denied_missing.stderr) == json.loads(rejected.stderr)
+              and not missing_db.exists() and not grant_file.exists() and not outbox.exists())
 
         cancelled = cli("cancel", "--db", timer_db)
         after_cancel = fixture(timer_db)
         check("cancellation_tombstone_survives_fresh_process",
-              cancelled["state"] == "CANCELLED" and after_cancel["state"] == "CANCELLED"
+              cancelled["state"] == "CANCELLED_LOCAL_ONLY"
+              and cancelled["independent_stop_witness"] == "UNAVAILABLE"
+              and after_cancel["state"] == "CANCELLED"
               and after_cancel["calls"] == 0)
-        cli("export", "--db", timer_db, "--proposal", proposal_id,
-            "--grant-file", grant_file, "--directory", outbox, expected=1)
-        check("cancellation_blocks_previously_granted_export", len(list(outbox.glob("*.json"))) == 1)
+        denied_after_stop = cli("export", "--db", timer_db, "--proposal", proposal_id,
+                                "--grant-file", forged, "--directory", outbox, expected=1)
+        check("cli_publication_hold_remains_after_local_cancel",
+              json.loads(denied_after_stop.stderr) == json.loads(rejected.stderr)
+              and not outbox.exists())
 
         event_db = base / "event.db"
         init(event_db)
@@ -214,7 +215,8 @@ def verify(args):
         command = [sys.executable, "-B", __file__, "--child", "--db", str(held_db),
                    "--entered", str(entered), "--release", str(release), "--seconds", "10"]
         process = subprocess.Popen(command, cwd=ROOT, env=environment,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   **child_options)
         try:
             deadline = time.monotonic() + 7
             while not entered.exists() and time.monotonic() < deadline:
@@ -224,7 +226,9 @@ def verify(args):
             check("separate_process_provider_enters_barrier", entered.exists())
             cancelled = cli("cancel", "--db", held_db)
             check("cancel_commits_while_other_process_provider_is_inflight",
-                  cancelled["state"] == "CANCELLED" and process.poll() is None)
+                  cancelled["state"] == "CANCELLED_LOCAL_ONLY"
+                  and cancelled["independent_stop_witness"] == "UNAVAILABLE"
+                  and process.poll() is None)
             release.write_text("release", encoding="ascii")
             stdout, stderr = process.communicate(timeout=12)
             commands.append({"argv": command, "exit_code": process.returncode})
