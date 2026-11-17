@@ -151,7 +151,11 @@ class GuardedModel:
             # Low salience is a host decision and does not need a model call.
             return ModelResponse(final_text=canonical({"message": "", "reason": "DEFERRED_LOW_SALIENCE"}))
         try:
-            reply = self.provider.respond(messages=messages, tools=[])
+            # Explicit typed host recurrence changes context only; it does not
+            # confer GRANT, STOP, or local publication authority.
+            model_messages = (runtime.recursive_drive.model_messages(runtime, messages)
+                              if runtime.recursive_drive is not None else messages)
+            reply = self.provider.respond(messages=model_messages, tools=[])
         except RetryableModelError:
             runtime._record(event_id, "DEFERRED_MODEL_FAILURE", {"reason": "RETRYABLE_BACKEND_FAILURE"}, runtime.clock())
             raise
@@ -219,7 +223,8 @@ class Runtime:
             store.close()
         return generation
 
-    def __init__(self, db_path, provider=None, *, clock=time.time, stop_authority=None):
+    def __init__(self, db_path, provider=None, *, clock=time.time,
+                 recursive_drive=None, stop_authority=None):
         path = Path(db_path).resolve()
         if not path.is_file():
             raise FileNotFoundError("explicitly initialized trial state required")
@@ -237,6 +242,12 @@ class Runtime:
             raise ValueError("host config digest changed")
         self.config = SyntheticConfig(**cfg)
         self.config_digest, self.generation = owner["config_digest"], owner["generation"]
+        from .recursive import RecursiveDrive
+        if recursive_drive is not None and type(recursive_drive) is not RecursiveDrive:
+            raise TypeError("explicit exact RecursiveDrive opt-in required")
+        self.recursive_drive = recursive_drive
+        if recursive_drive is not None:
+            recursive_drive.bind(self)
         self.worker_id = "initiative-" + str(uuid.uuid4())
         self.provider = provider
         self.engine = Engine(store=self.store, model=GuardedModel(self, provider),
@@ -420,6 +431,8 @@ class Runtime:
                 score = json.loads(row["score_json"])
                 if not score["followup_candidate"]:
                     self._record(event_id, "DEFERRED_LOW_SALIENCE", {"score": score}, now)
+                    if self.recursive_drive is not None:
+                        self.recursive_drive.accept_completed(self, event_id)
                     continue
                 body = self.validate_output(ModelResponse(final_text=row["final_text"]))
                 proposal_id = digest([self.generation, event_id])
@@ -440,6 +453,10 @@ class Runtime:
                             "provenance": PROVENANCE}
                 self.store.connection.execute("INSERT OR IGNORE INTO initiative_proposals VALUES(?,?,?,?,?)",
                                               (proposal_id, event_id, digest(proposal), canonical(proposal), now))
+                if self.recursive_drive is not None:
+                    # A committed terminal proposal updates recurrence once
+                    # inside the same SQLite transaction.
+                    self.recursive_drive.accept_completed(self, event_id)
                 self._record(event_id, "PROPOSED_LOCAL_ONLY", {"proposal_id": proposal_id, "score": score}, now)
 
     def cycle(self, *, now=None):
