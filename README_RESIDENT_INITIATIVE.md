@@ -89,24 +89,21 @@ its own owner permission, recipient, expiry and idempotency, and distinguish
 gateway acceptance, device receipt/render and reply. A local artifact or HTTP
 success cannot substitute for these proofs.
 
-An explicit owner-only local export is available for review:
+The standalone CLI holds `grant-local` and `export` at entry and reports
+`PUBLICATION_HELD` with reason `PROTECTED_HOST_PUBLISHER_UNAVAILABLE`.
+Its `cancel` records local cancellation and reports `CANCELLED_LOCAL_ONLY`.
+Protected STOP requires the independent owner custodian.
 
-```text
-python -B -m resident_initiative grant-local --db PRIVATE_DB --proposal PROPOSAL_ID --directory PRIVATE_OUT --grant-file PRIVATE_GRANT --ttl-seconds 60
-python -B -m resident_initiative export --db PRIVATE_DB --proposal PROPOSAL_ID --directory PRIVATE_OUT --grant-file PRIVATE_GRANT
-```
-
-The separate `LocalHandoffGate` freshly verifies the proposal body digest and
-synthetic schema invariants and requires a persisted digest/generation/directory
-bound grant. A fabricated JSON grant alone cannot authorize anything. Export is
-atomic, uses one stable filename and verifies exact existing bytes on repeat.
-Divergent artifacts are never overwritten. Even a valid local grant grants zero
-person-contact authority. Model output cannot issue grants or call this gate.
+The resident API verifies the proposal digest and local grant bindings before
+passing exact synthetic bytes and an independent operator grant to the
+custodian. The custodian owns publication and serializes it with revocation.
+This path grants zero person-contact authority.
 
 ## Verification
 
 ```text
 python -B -m unittest discover -s tests -v
+python -B tests/verify_process_acceptance.py
 ```
 
 The focused runtime suite covers real substrate timer execution, restart/dedupe,
